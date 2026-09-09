@@ -8,15 +8,31 @@ Whole-genome resequencing variant-calling and annotation pipeline applied to thr
 | Ara3_15000 | 15,000 | SRR2584863 |
 | Ara3_50000 | 50,000 | SRR2584866 |
 
-## Pipeline
-1. Raw read download and QC
-2. Adapter/quality trimming and post-trim QC
-3. Reference genome preparation and alignment
-4. Variant calling and functional annotation
-5. Downstream analysis in R: VCF parsing, variant-count summaries, mutation-spectrum analysis, and annotated high-impact/biologically flagged variant tables (including DNA-repair and citrate-related genes, relevant to LTEE's known Cit+ phenotype evolution)
+## Pipeline provenance
+
+The pipeline structure (script stages, tools, and dataset) was provided as a course assignment template; each student ran it independently on the same assigned samples. The commands, execution, result interpretation, and downstream analysis in this repository are my own.
+
+## Structure
+```
+scripts/                     Shell pipeline (run in numeric order)
+  01_download.sh              Download raw reads
+  02_raw_qc.sh                Raw-read QC (FastQC/MultiQC)
+  03_trim.sh                  Adapter/quality trimming
+  04_trimmed_qc.sh            Post-trim QC
+  05_prepare_reference.sh     Reference genome preparation
+  06_align.sh                 Alignment to REL606
+  07_variant_calling.sh       Variant calling
+  10_annotate_variants.sh     Functional annotation
+metadata/samples.tsv         Sample-to-generation-to-SRA-run mapping
+downstream_analysis.Rmd      R analysis: VCF parsing, variant-count and
+                              mutation-spectrum summaries, annotated
+                              high-impact/DNA-repair/citrate-gene variant
+                              tables
+```
+Raw sequencing data, reference indexes, BAMs, and VCFs are not included due to size — see the full rendered report for all figures and tables.
 
 ## Report
 Full rendered report: [`/reports/variant-analysis-ltee_report.pdf`](../../reports/variant-analysis-ltee_report.pdf)
 
 ## Tools
-Shell pipeline (QC/trimming/alignment/variant-calling tools), R for downstream VCF analysis and visualization
+FastQC, MultiQC, Trimmomatic, BWA/SAMtools, a variant caller, snpEff-style annotation, R (vcfR, tidyverse) for downstream analysis

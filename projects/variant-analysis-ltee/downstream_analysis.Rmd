@@ -1,0 +1,189 @@
+---
+title: "LTEE Ara-3 Variant Analysis — Downstream Analysis (R)"
+subtitle: "Continues from scripts/01_download.sh through scripts/10_annotate_variants.sh"
+author: "Ebenezer Oppong Gyamfi"
+output: html_document
+---
+
+# Downstream Analysis (R)
+
+## Parsing VCFs directly
+
+```{r vcf-parsing, eval=FALSE}
+# Requires results/vcf/<run>.PASS.norm.vcf.gz to exist on disk
+runs <- samples$run
+
+vcf_list <- map(runs, function(run) {
+  vcf_path <- file.path(vcf_dir, paste0(run, ".PASS.norm.vcf.gz"))
+  read.vcfR(vcf_path, verbose = FALSE)
+})
+names(vcf_list) <- runs
+
+# Example: extract fixed fields (CHROM, POS, REF, ALT, QUAL) for one sample
+vcf_fix <- as_tibble(getFIX(vcf_list[["SRR2584866"]]))
+kable(head(vcf_fix, 10), caption = "First 10 variant records — SRR2584866 (generation 50,000)")
+```
+
+## Variant count summary (from `variant_counts.tsv` / `pass_variant_summary.tsv`)
+
+```{r variant-counts}
+# variant_counts.tsv: sample, generation, run, raw_variants, filtered_variants
+variant_counts <- tribble(
+  ~sample,      ~generation, ~run,         ~raw_variants, ~filtered_variants,
+  "Ara3_5000",  5000,        "SRR2589044", 13,            9,
+  "Ara3_15000", 15000,       "SRR2584863", 30,            26,
+  "Ara3_50000", 50000,       "SRR2584866", 817,           794
+)
+
+# pass_variant_summary.tsv: sample, generation, run, pass_variants, snps, indels, ts_tv
+pass_summary <- tribble(
+  ~sample,      ~generation, ~run,         ~pass_variants, ~snps, ~indels, ~ts_tv,
+  "Ara3_5000",  5000,        "SRR2589044", 9,              6,     3,       2.00,
+  "Ara3_15000", 15000,       "SRR2584863", 26,             20,    6,       0.33,
+  "Ara3_50000", 50000,       "SRR2584866", 794,            688,   106,     10.86
+)
+
+kable(variant_counts, caption = "Raw vs. quality-filtered (PASS) variant counts per sample")
+kable(pass_summary, caption = "PASS variant composition and Ts/Tv ratio per sample")
+```
+
+```{r variant-counts-plot}
+pass_summary %>%
+  select(sample, generation, snps, indels) %>%
+  pivot_longer(c(snps, indels), names_to = "type", values_to = "count") %>%
+  mutate(sample = fct_reorder(sample, generation)) %>%
+  ggplot(aes(x = sample, y = count, fill = type)) +
+  geom_col(position = "stack") +
+  labs(title = "PASS SNPs vs. indels by generation",
+       x = "Sample (ordered by generation)", y = "Variant count", fill = "Type") +
+  theme_minimal()
+```
+
+```{r tstv-plot}
+ggplot(pass_summary, aes(x = generation, y = ts_tv)) +
+  geom_line(color = "steelblue") +
+  geom_point(size = 3, color = "steelblue") +
+  scale_x_continuous(breaks = pass_summary$generation) +
+  labs(title = "Transition/Transversion (Ts/Tv) ratio across generations",
+       x = "Generation", y = "Ts/Tv ratio") +
+  theme_minimal()
+```
+
+## Mutation spectrum (from `substitution_spectrum.tsv`)
+
+```{r mutation-spectrum}
+substitution_spectrum <- tribble(
+  ~sample, ~generation, ~run, ~substitution, ~count,
+  "Ara3_5000", 5000, "SRR2589044", "A>G", 2,
+  "Ara3_5000", 5000, "SRR2589044", "A>C", 0,
+  "Ara3_5000", 5000, "SRR2589044", "A>T", 0,
+  "Ara3_5000", 5000, "SRR2589044", "C>T", 2,
+  "Ara3_5000", 5000, "SRR2589044", "C>G", 0,
+  "Ara3_5000", 5000, "SRR2589044", "C>A", 2,
+  "Ara3_15000", 15000, "SRR2584863", "A>G", 2,
+  "Ara3_15000", 15000, "SRR2584863", "A>C", 8,
+  "Ara3_15000", 15000, "SRR2584863", "A>T", 1,
+  "Ara3_15000", 15000, "SRR2584863", "C>T", 3,
+  "Ara3_15000", 15000, "SRR2584863", "C>G", 0,
+  "Ara3_15000", 15000, "SRR2584863", "C>A", 6,
+  "Ara3_50000", 50000, "SRR2584866", "A>G", 260,
+  "Ara3_50000", 50000, "SRR2584866", "A>C", 13,
+  "Ara3_50000", 50000, "SRR2584866", "A>T", 9,
+  "Ara3_50000", 50000, "SRR2584866", "C>T", 370,
+  "Ara3_50000", 50000, "SRR2584866", "C>G", 12,
+  "Ara3_50000", 50000, "SRR2584866", "C>A", 24
+)
+
+datatable(substitution_spectrum, caption = "Collapsed substitution spectrum by sample")
+```
+
+```{r spectrum-plot, fig.width=9}
+substitution_spectrum %>%
+  mutate(sample = fct_reorder(sample, generation)) %>%
+  ggplot(aes(x = substitution, y = count, fill = substitution)) +
+  geom_col() +
+  facet_wrap(~ sample, scales = "free_y") +
+  labs(title = "Collapsed single-nucleotide substitution spectrum",
+       x = "Substitution class", y = "Count") +
+  theme_minimal() +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## Functional annotation summary (from `impact_summary.tsv` / `consequence_summary.tsv`)
+
+```{r impact-summary}
+impact_summary <- tribble(
+  ~generation, ~impact,     ~count,
+  5000,        "HIGH",      2,
+  5000,        "MODERATE",  6,
+  5000,        "MODIFIER",  75,
+  15000,       "HIGH",      3,
+  15000,       "MODERATE",  17,
+  15000,       "MODIFIER",  232,
+  50000,       "HIGH",      72,
+  50000,       "LOW",       213,
+  50000,       "MODERATE",  374,
+  50000,       "MODIFIER",  7367
+)
+
+datatable(impact_summary, caption = "SnpEff impact-category counts by generation")
+```
+
+```{r impact-plot}
+impact_summary %>%
+  mutate(impact = factor(impact, levels = c("HIGH", "MODERATE", "LOW", "MODIFIER"))) %>%
+  ggplot(aes(x = factor(generation), y = count, fill = impact)) +
+  geom_col(position = "fill") +
+  labs(title = "Relative proportion of SnpEff impact categories by generation",
+       x = "Generation", y = "Proportion", fill = "Impact") +
+  theme_minimal()
+```
+
+```{r consequence-summary}
+consequence_summary <- tribble(
+  ~generation, ~consequence,          ~count,
+  5000,  "missense_variant",   6,
+  5000,  "frameshift_variant", 2,
+  5000,  "intergenic_region",  1,
+  15000, "missense_variant",   16,
+  15000, "frameshift_variant", 3,
+  15000, "intergenic_region",  6,
+  50000, "missense_variant",     369,
+  50000, "synonymous_variant",   212,
+  50000, "frameshift_variant",   62,
+  50000, "stop_gained",          9,
+  50000, "intergenic_region",    122
+)
+
+datatable(consequence_summary, caption = "Selected SnpEff consequence-type counts by generation (coding + intergenic classes)")
+```
+
+## Annotated gene table — high-impact and biologically flagged variants
+
+```{r gene-table}
+# Subset drawn from results/statistics/annotation/high_impact_variants.tsv,
+# citrate_gene_variants.tsv, and dna_repair_variants.tsv
+flagged_variants <- tribble(
+  ~sample,       ~generation, ~gene,  ~consequence,        ~impact,    ~hgvs_p,
+  "Ara3_50000",  50000,       "mutS", "stop_gained",        "HIGH",     "p.Gln606*",
+  "Ara3_50000",  50000,       "mutS", "missense_variant",   "MODERATE", "p.Arg500His",
+  "Ara3_50000",  50000,       "mutL", "missense_variant",   "MODERATE", "p.Ser567Gly",
+  "Ara3_5000",   5000,        "dam",  "missense_variant",   "MODERATE", "p.Pro141Thr",
+  "Ara3_50000",  50000,       "citT", "missense_variant",   "MODERATE", "p.Thr341Ile",
+  "Ara3_50000",  50000,       "citF", "missense_variant",   "MODERATE", "p.Glu51Lys",
+  "Ara3_50000",  50000,       "citA", "frameshift_variant", "HIGH",     "p.Val493fs",
+  "Ara3_50000",  50000,       "lacZ", "stop_gained",        "HIGH",     "p.Trp433*",
+  "Ara3_50000",  50000,       "ddlB", "stop_gained",        "HIGH",     "p.Trp182*",
+  "Ara3_50000",  50000,       "mutY", "frameshift_variant", "HIGH",     "p.Gly318fs"
+)
+
+datatable(flagged_variants,
+          caption = "Selected high-impact and biologically flagged variants (mismatch-repair and citrate-operon genes)",
+          options = list(pageLength = 10))
+```
+
+# Session Info
+
+```{r session-info}
+sessionInfo()
+```
