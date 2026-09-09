@@ -1,0 +1,659 @@
+---
+title: "RNAseq Analysis"
+subtitle: "Reproducible RNA-Seq Analysis Workflow"
+author: "Ebenezer"
+date: "`r format(Sys.Date(), '%B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    theme: flatly
+  pdf_document:
+    toc: true
+    number_sections: true
+  word_document:
+    toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo       = TRUE,
+  warning    = FALSE,
+  message    = TRUE,
+  fig.align  = "center",
+  fig.width  = 8,
+  fig.height = 6
+)
+
+# ---------------------------------------------------------------------------
+# Project root. Change this if the pipeline directory structure below is not
+# located in the current working directory when this document is knit.
+# ---------------------------------------------------------------------------
+PROJECT_ROOT <- "."
+```
+
+# Overview
+
+This document is a single, self-contained, reproducible record of the RNA-seq
+workflow used to generate the report. It reproduces, in order:
+
+1. Raw-read quality control (FastQC / MultiQC) — **Stage 1**
+2. Reference indexing and splice-aware alignment (HISAT2 / SAMtools) — **Stage 2**
+3. Library-strandedness verification (featureCounts) — **strandedness check**
+4. Gene-level quantification (featureCounts) — **Stage 3**
+5. Differential expression modelling, diagnostics, and figure/table generation
+   (DESeq2 in R) — **Stage 4**, executed directly in this document.
+
+Stages 1–3 depend on command-line bioinformatics tools, multi-gigabyte raw
+sequencing files, and a full GRCh38/GENCODE reference build, and are
+therefore documented here as **shell chunks** (`bash`, not evaluated when
+this document is knit). Stage 4 depends only on the gene-count matrix
+produced by Stage 3 and is written as **executable R chunks**: if the
+expected input files are present under `PROJECT_ROOT`, this document will
+regenerate every table and figure used in the accompanying Word report when
+knit (`rmarkdown::render()`), including the DEG tables, PCA, sample-correlation
+heatmap, dispersion plot, and the per-contrast MA plots, volcano plots and
+top-50 DEG heatmaps.
+
+Expected directory layout (created automatically by Stages 1–3):
+
+```
+.
+├── metadata/
+│   ├── SRP144496_metadata.tsv        # run_accession, fastq_ftp, fastq_bytes, ...
+│   └── samplesheet.csv               # sample, run, cell_line, condition, replicate
+├── raw_data/                         # downloaded FASTQ files
+├── reference_genome/gencode_v50/     # GRCh38 FASTA, GENCODE v50 GTF, HISAT2 index
+├── results/
+│   ├── 01_raw_fastqc/
+│   ├── 02_raw_multiqc/
+│   ├── 03_alignment/
+│   ├── 04_alignment_multiqc/
+│   ├── 05_strandedness/
+│   ├── 06_quantification/
+│   ├── 07_quantification_multiqc/
+│   └── 08_differential_expression/   # <- populated by this document (Stage 4)
+├── scripts/
+└── logs/
+```
+
+---
+
+# Stage 1 — Raw Read Quality Assessment and Pre-processing
+
+FASTQ files are integrity-checked against expected file sizes and gzip
+checksums, re-downloaded automatically on failure, then assessed with
+FastQC and aggregated with MultiQC. No adapter or quality trimming is
+applied (see report Section 5.2, Limitations): the FastQC Adapter Content
+module passed for every sample, and the splice-aware aligner used in
+Stage 2 tolerates soft-clipping of low-quality read ends.
+
+```{bash stage1-qc, eval=FALSE}
+#!/usr/bin/env bash
+set -euo pipefail
+
+METADATA="metadata/SRP144496_metadata.tsv"
+RAW_DIR="raw_data"
+FASTQC_DIR="results/01_raw_fastqc"
+MULTIQC_DIR="results/02_raw_multiqc"
+THREADS=4
+MAX_DOWNLOAD_ATTEMPTS=3
+
+mkdir -p "$RAW_DIR" "$FASTQC_DIR" "$MULTIQC_DIR" logs
+
+# --- dependency check ------------------------------------------------------
+for PROGRAM in awk wget gzip stat fastqc multiqc; do
+  command -v "$PROGRAM" >/dev/null 2>&1 || { echo "Missing: $PROGRAM"; exit 1; }
+done
+
+# --- validate / recover every FASTQ listed in the metadata table -----------
+validate_fastq() {
+  local file="$1" expected_size="$2"
+  [[ -s "$file" ]] || return 1
+  [[ "$(stat -c%s "$file")" -eq "$expected_size" ]] || return 1
+  gzip -t "$file" 2>/dev/null || return 1
+  return 0
+}
+
+RUN_COL=$(head -1 "$METADATA"  | tr '\t' '\n' | nl -ba | awk '$2=="run_accession"{print $1}')
+FTP_COL=$(head -1 "$METADATA"  | tr '\t' '\n' | nl -ba | awk '$2=="fastq_ftp"{print $1}')
+BYTE_COL=$(head -1 "$METADATA" | tr '\t' '\n' | nl -ba | awk '$2=="fastq_bytes"{print $1}')
+
+while IFS=$'\t' read -r RUN URL EXPECTED_SIZE; do
+  FASTQ="${RAW_DIR}/${RUN}.fastq.gz"
+  if validate_fastq "$FASTQ" "$EXPECTED_SIZE"; then continue; fi
+
+  [[ "$URL" == http* || "$URL" == ftp* ]] || URL="https://${URL}"
+  for ((attempt=1; attempt<=MAX_DOWNLOAD_ATTEMPTS; attempt++)); do
+    rm -f "$FASTQ"
+    wget --tries=5 --timeout=60 --continue -O "$FASTQ" "$URL" && break
+    sleep 3
+  done
+  validate_fastq "$FASTQ" "$EXPECTED_SIZE" || { echo "FAILED: $RUN"; exit 1; }
+done < <(awk -F'\t' -v r="$RUN_COL" -v f="$FTP_COL" -v b="$BYTE_COL" \
+            'NR>1 {print $r"\t"$f"\t"$b}' "$METADATA")
+
+# --- QC ----------------------------------------------------------------
+fastqc --threads "$THREADS" --outdir "$FASTQC_DIR" "$RAW_DIR"/*.fastq.gz
+
+multiqc "$FASTQC_DIR" \
+  --outdir "$MULTIQC_DIR" \
+  --filename SRP144496_raw_multiqc.html \
+  --force
+```
+
+---
+
+# Stage 2 — Reference Genome Indexing and Alignment
+
+Reads are aligned to the **GRCh38 primary assembly** with **GENCODE release
+50** annotation using **HISAT2** in splice-aware, single-end mode, with a
+splice-site index built once from the GTF and reused across all sixteen
+samples. Alignments are coordinate-sorted and indexed with SAMtools, and
+per-sample mapping statistics are aggregated with MultiQC.
+
+```{bash stage2-alignment, eval=FALSE}
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS="${THREADS:-8}"
+GENCODE_VERSION=50
+RAW_DIR="raw_data"
+REF_DIR="reference_genome/gencode_v${GENCODE_VERSION}"
+INDEX_PREFIX="${REF_DIR}/hisat2_index/GRCh38"
+ALIGN_DIR="results/03_alignment"
+MULTIQC_DIR="results/04_alignment_multiqc"
+
+GENOME="${REF_DIR}/GRCh38.primary_assembly.genome.fa"
+GTF="${REF_DIR}/gencode.v${GENCODE_VERSION}.primary_assembly.annotation.gtf"
+SPLICE_SITES="${REF_DIR}/gencode.v${GENCODE_VERSION}.splicesites.txt"
+
+GENOME_URL="https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_${GENCODE_VERSION}/GRCh38.primary_assembly.genome.fa.gz"
+GTF_URL="https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_${GENCODE_VERSION}/gencode.v${GENCODE_VERSION}.primary_assembly.annotation.gtf.gz"
+
+mkdir -p "$REF_DIR" "$(dirname "$INDEX_PREFIX")" "$ALIGN_DIR" "$MULTIQC_DIR" logs
+
+# --- dependency check ------------------------------------------------------
+for PROGRAM in hisat2 hisat2-build hisat2_extract_splice_sites.py samtools wget gzip awk multiqc; do
+  command -v "$PROGRAM" >/dev/null 2>&1 || { echo "Missing: $PROGRAM"; exit 1; }
+done
+
+# --- reference genome + annotation -----------------------------------------
+[[ -s "$GENOME" ]] || { wget -O "${GENOME}.gz" "$GENOME_URL"; gzip -dc "${GENOME}.gz" > "$GENOME"; }
+[[ -s "$GTF" ]]    || { wget -O "${GTF}.gz"    "$GTF_URL";    gzip -dc "${GTF}.gz"    > "$GTF"; }
+[[ -s "$SPLICE_SITES" ]] || hisat2_extract_splice_sites.py "$GTF" > "$SPLICE_SITES"
+
+# --- HISAT2 index (built once, reused across all samples) ------------------
+if ! ls "${INDEX_PREFIX}".*.ht2 >/dev/null 2>&1; then
+  hisat2-build -p "$THREADS" "$GENOME" "$INDEX_PREFIX"
+fi
+
+# --- align every sample ------------------------------------------------
+for FASTQ in "$RAW_DIR"/*.fastq.gz; do
+  RUN=$(basename "$FASTQ" .fastq.gz)
+  SAMPLE_DIR="${ALIGN_DIR}/${RUN}"
+  mkdir -p "$SAMPLE_DIR"
+  BAM="${SAMPLE_DIR}/${RUN}.sorted.bam"
+
+  hisat2 -p "$THREADS" -x "$INDEX_PREFIX" -U "$FASTQ" \
+    --known-splicesite-infile "$SPLICE_SITES" \
+    --summary-file "${SAMPLE_DIR}/${RUN}_hisat2_summary.txt" \
+    --new-summary \
+  | samtools sort -@ 2 -o "$BAM" -
+
+  samtools index -@ 2 "$BAM"
+  samtools flagstat -@ 2 "$BAM" > "${SAMPLE_DIR}/${RUN}_flagstat.txt"
+done
+
+multiqc "$ALIGN_DIR" \
+  --outdir "$MULTIQC_DIR" \
+  --filename SRP144496_alignment_multiqc_report.html \
+  --force
+```
+
+---
+
+# Strandedness Verification
+
+Before final quantification, library strandedness is confirmed empirically
+by summarising the same BAM files with `featureCounts` under all three
+strand assumptions (`-s 0` unstranded, `-s 1` forward-stranded, `-s 2`
+reverse-stranded) and comparing gene-assignment rates; the setting with the
+highest assignment rate (reverse-stranded, `-s 2`, for this dataset) is
+carried forward into Stage 3.
+
+```{bash strandedness-check, eval=FALSE}
+#!/usr/bin/env bash
+set -euo pipefail
+
+DIR="results/05_strandedness"
+mkdir -p "$DIR"
+
+assignment_pct() {
+  awk -F'\t' '
+    NR==1 { for (i=2;i<=NF;i++){ s[i]=$i; sub(/^.*\//,"",s[i]); sub(/\.sorted\.bam$/,"",s[i]) }; next }
+    { for (i=2;i<=NF;i++){ total[i]+=$i; if ($1=="Assigned") assigned[i]=$i } }
+    END { for (i=2;i<=NF;i++) printf "%s\t%.4f\n", s[i], 100*assigned[i]/total[i] }
+  ' "$1"
+}
+
+paste <(assignment_pct "$DIR/counts_s0.txt.summary") \
+      <(assignment_pct "$DIR/counts_s1.txt.summary") \
+      <(assignment_pct "$DIR/counts_s2.txt.summary") |
+  awk 'BEGIN{printf "%-15s %10s %10s %10s\n","SAMPLE","s0 (%)","s1 (%)","s2 (%)"}
+       {printf "%-15s %10.2f %10.2f %10.2f\n",$1,$2,$4,$6}'
+```
+
+---
+
+# Stage 3 — Expression Quantification
+
+Gene-level counts are generated with **featureCounts** (Subread) under
+exon-level summarisation to `gene_id`, reverse-stranded mode (`-s 2`), in a
+single invocation across all sixteen sorted BAM files, producing one
+integer count matrix (78,941 GENCODE gene records × 16 samples).
+
+```{bash stage3-quantification, eval=FALSE}
+#!/usr/bin/env bash
+set -euo pipefail
+
+THREADS="${THREADS:-6}"
+STRAND_MODE=2
+GTF="reference_genome/gencode_v50/gencode.v50.primary_assembly.annotation.gtf"
+ALIGN_DIR="results/03_alignment"
+COUNT_DIR="results/06_quantification"
+MULTIQC_DIR="results/07_quantification_multiqc"
+COUNTS="${COUNT_DIR}/SRP144496_featureCounts.txt"
+MATRIX="${COUNT_DIR}/SRP144496_gene_counts.tsv"
+
+mkdir -p "$COUNT_DIR" "$MULTIQC_DIR" logs
+
+BAMS=( "$ALIGN_DIR"/*/*.sorted.bam )
+[[ "${#BAMS[@]}" -eq 16 ]] || { echo "Expected 16 BAMs, found ${#BAMS[@]}"; exit 1; }
+
+featureCounts -T "$THREADS" -s "$STRAND_MODE" -t exon -g gene_id \
+  -a "$GTF" -o "$COUNTS" "${BAMS[@]}"
+
+# --- clean, DESeq2-ready count matrix (drop featureCounts metadata cols) --
+awk '
+  BEGIN { FS=OFS="\t" }
+  NR==1 && /^#/ { next }
+  $1=="Geneid" {
+    printf "gene_id"
+    for (i=7;i<=NF;i++){ s=$i; sub(/^.*\//,"",s); sub(/\.sorted\.bam$/,"",s); printf OFS s }
+    printf "\n"; next
+  }
+  { printf $1; for (i=7;i<=NF;i++) printf OFS $i; printf "\n" }
+' "$COUNTS" > "$MATRIX"
+
+multiqc "$COUNT_DIR" \
+  --outdir "$MULTIQC_DIR" \
+  --filename SRP144496_quantification_multiqc.html \
+  --force
+```
+
+---
+
+# Stage 4 — Differential Expression Analysis (executed in this document)
+
+The remaining chunks are **live R code**. When the count matrix and sample
+sheet produced by Stages 1–3 are present under `PROJECT_ROOT`, running
+(knitting) this document regenerates the complete DESeq2 analysis: PCA,
+sample-correlation and dispersion diagnostics, and, for each cell line
+(HT55 and SW948), annotated DESeq2 result tables, significant/up/down DEG
+tables, an MA plot, a labelled volcano plot, and a top-50 DEG heatmap —
+identical in content to the tables and figures presented in the
+accompanying Word report.
+
+## Configuration and required packages
+
+```{r libraries}
+required_pkgs <- c("DESeq2", "ggplot2", "pheatmap", "ggrepel")
+missing_pkgs  <- required_pkgs[!vapply(required_pkgs, requireNamespace,
+                                        quietly = TRUE, FUN.VALUE = logical(1))]
+if (length(missing_pkgs) > 0) {
+  message(
+    "The following packages are required but not installed: ",
+    paste(missing_pkgs, collapse = ", "),
+    "\nInstall with: BiocManager::install(c(",
+    paste(sprintf('\"%s\"', missing_pkgs), collapse = ", "), "))"
+  )
+}
+
+suppressPackageStartupMessages({
+  if (requireNamespace("DESeq2",  quietly = TRUE)) library(DESeq2)
+  if (requireNamespace("ggplot2", quietly = TRUE)) library(ggplot2)
+  if (requireNamespace("pheatmap",quietly = TRUE)) library(pheatmap)
+  if (requireNamespace("ggrepel", quietly = TRUE)) library(ggrepel)
+})
+```
+
+```{r config}
+COUNT_FILE <- file.path(PROJECT_ROOT, "results/06_quantification/SRP144496_gene_counts.tsv")
+META_FILE  <- file.path(PROJECT_ROOT, "metadata/samplesheet.csv")
+GTF_FILE   <- file.path(PROJECT_ROOT, "reference_genome/gencode_v50/gencode.v50.primary_assembly.annotation.gtf")
+OUTDIR     <- file.path(PROJECT_ROOT, "results/08_differential_expression")
+
+PADJ_THRESHOLD     <- 0.05   # Benjamini-Hochberg FDR
+LFC_THRESHOLD      <- 1      # |log2 fold-change|
+MIN_COUNT          <- 10     # independent low-expression filter
+MIN_SAMPLES        <- 4      # ... in at least this many samples
+TOP_HEATMAP_GENES  <- 50
+TOP_VOLCANO_LABELS <- 10
+
+dir.create(OUTDIR, recursive = TRUE, showWarnings = FALSE)
+
+INPUTS_AVAILABLE <- file.exists(COUNT_FILE) && file.exists(META_FILE) && file.exists(GTF_FILE)
+if (!INPUTS_AVAILABLE) {
+  message(
+    "One or more required inputs were not found under PROJECT_ROOT ('", PROJECT_ROOT, "').\n",
+    "Run Stages 1-3 above first, or point PROJECT_ROOT at a directory that already ",
+    "contains their outputs. Remaining Stage 4 chunks will be skipped."
+  )
+}
+```
+
+## Load count matrix, sample metadata, and GENCODE gene annotation
+
+```{r load-data, eval=INPUTS_AVAILABLE}
+counts <- read.delim(COUNT_FILE, header = TRUE, row.names = 1, check.names = FALSE)
+stopifnot(ncol(counts) == 16)
+counts <- as.matrix(counts)
+storage.mode(counts) <- "integer"
+stopifnot(!anyNA(counts), all(counts >= 0))
+
+meta <- read.csv(META_FILE, stringsAsFactors = FALSE, check.names = FALSE)
+required_columns <- c("sample", "run", "cell_line", "condition", "replicate")
+stopifnot(all(required_columns %in% colnames(meta)))
+stopifnot(all(colnames(counts) %in% meta$run))
+meta <- meta[match(colnames(counts), meta$run), ]
+rownames(meta) <- meta$run
+
+# --- GENCODE gene-level annotation, parsed directly from the GTF ----------
+gene_lines <- system(sprintf("awk -F '\t' '$3 == \"gene\" {print}' %s", shQuote(GTF_FILE)), intern = TRUE)
+gtf_genes  <- read.delim(text = gene_lines, sep = "\t", header = FALSE, quote = "",
+                          comment.char = "", stringsAsFactors = FALSE)
+colnames(gtf_genes) <- c("seqname","source","feature","start","end","score","strand","frame","attribute")
+
+extract_gtf_attribute <- function(x, attribute) {
+  pattern <- paste0(".*", attribute, ' "([^"]+)".*')
+  result  <- sub(pattern, "\\1", x)
+  result[result == x] <- NA
+  result
+}
+
+gene_annotation <- data.frame(
+  gene_id     = extract_gtf_attribute(gtf_genes$attribute, "gene_id"),
+  gene_symbol = extract_gtf_attribute(gtf_genes$attribute, "gene_name"),
+  gene_type   = extract_gtf_attribute(gtf_genes$attribute, "gene_type"),
+  stringsAsFactors = FALSE
+)
+gene_annotation$ensembl_gene_id <- sub("\\..*$", "", gene_annotation$gene_id)
+gene_annotation <- gene_annotation[!duplicated(gene_annotation$gene_id), ]
+
+write.table(gene_annotation, file.path(OUTDIR, "GENCODE_gene_annotation.tsv"),
+            sep = "\t", row.names = FALSE, quote = FALSE)
+
+cat("Genes loaded:  ", nrow(counts), "\n")
+cat("Samples loaded:", ncol(counts), "\n")
+cat("GENCODE genes annotated:", nrow(gene_annotation), "\n")
+```
+
+## Experimental design and DESeq2 dataset construction
+
+```{r design, eval=INPUTS_AVAILABLE}
+meta$cell_line <- factor(meta$cell_line, levels = c("HT55", "SW948"))
+meta$condition <- factor(meta$condition, levels = c("control", "itraconazole"))
+meta$group <- factor(
+  paste(meta$cell_line, meta$condition, sep = "_"),
+  levels = c("HT55_control", "HT55_itraconazole", "SW948_control", "SW948_itraconazole")
+)
+print(table(meta$cell_line, meta$condition))
+stopifnot(all(table(meta$group) >= 2))
+
+write.csv(meta, file.path(OUTDIR, "sample_metadata_used.csv"), row.names = TRUE)
+
+dds <- DESeqDataSetFromMatrix(countData = counts, colData = meta, design = ~ group)
+genes_before <- nrow(dds)
+
+# --- independent low-expression filter: count >= 10 in >= 4 samples -------
+keep <- rowSums(counts(dds) >= MIN_COUNT) >= MIN_SAMPLES
+dds  <- dds[keep, ]
+genes_after <- nrow(dds)
+
+cat("Genes before filtering:", genes_before, "\n")
+cat("Genes after filtering: ", genes_after, "\n")
+cat("Genes removed:         ", genes_before - genes_after, "\n")
+
+write.table(
+  data.frame(genes_before, genes_after, genes_removed = genes_before - genes_after,
+             minimum_count = MIN_COUNT, minimum_samples = MIN_SAMPLES),
+  file.path(OUTDIR, "filtering_summary.tsv"), sep = "\t", row.names = FALSE, quote = FALSE
+)
+```
+
+## Model fitting
+
+```{r deseq2-fit, eval=INPUTS_AVAILABLE}
+dds <- DESeq(dds)
+saveRDS(dds, file.path(OUTDIR, "SRP144496_DESeq2_object.rds"))
+
+normalized_counts <- counts(dds, normalized = TRUE)
+idx <- match(rownames(normalized_counts), gene_annotation$gene_id)
+normalized_output <- data.frame(
+  gene_id         = rownames(normalized_counts),
+  ensembl_gene_id = sub("\\..*$", "", rownames(normalized_counts)),
+  gene_symbol     = gene_annotation$gene_symbol[idx],
+  gene_type       = gene_annotation$gene_type[idx],
+  as.data.frame(normalized_counts, check.names = FALSE),
+  check.names = FALSE
+)
+write.table(normalized_output, file.path(OUTDIR, "normalized_counts.tsv"),
+            sep = "\t", row.names = FALSE, quote = FALSE)
+```
+
+## Sample-level diagnostics: PCA, correlation, and dispersion
+
+```{r vst, eval=INPUTS_AVAILABLE}
+vsd <- vst(dds, blind = FALSE)
+saveRDS(vsd, file.path(OUTDIR, "SRP144496_VST_object.rds"))
+```
+
+```{r pca-plot, eval=INPUTS_AVAILABLE, fig.cap="Figure 1. PCA of variance-stabilised expression across all 16 samples."}
+pca_data <- plotPCA(vsd, intgroup = c("cell_line", "condition"), returnData = TRUE)
+percent_var <- round(100 * attr(pca_data, "percentVar"))
+pca_data$sample <- rownames(pca_data)
+
+pca_plot <- ggplot(pca_data, aes(PC1, PC2, colour = condition, shape = cell_line, label = sample)) +
+  geom_point(size = 4) +
+  geom_text_repel(size = 3, max.overlaps = Inf) +
+  xlab(paste0("PC1: ", percent_var[1], "% variance")) +
+  ylab(paste0("PC2: ", percent_var[2], "% variance")) +
+  ggtitle("SRP144496 PCA") +
+  theme_bw(base_size = 12)
+
+ggsave(file.path(OUTDIR, "PCA_all_samples.png"), pca_plot, width = 9, height = 7, dpi = 300)
+pca_plot
+```
+
+```{r correlation-heatmap, eval=INPUTS_AVAILABLE, fig.cap="Figure 2. Pairwise sample correlation heatmap."}
+sample_cor <- cor(assay(vsd))
+sample_annotation <- data.frame(Cell_line = meta$cell_line, Condition = meta$condition)
+rownames(sample_annotation) <- rownames(meta)
+
+png(file.path(OUTDIR, "sample_correlation_heatmap.png"), width = 2200, height = 2000, res = 250)
+pheatmap(sample_cor, annotation_col = sample_annotation, annotation_row = sample_annotation,
+         main = "Sample correlation", border_color = NA)
+dev.off()
+
+pheatmap(sample_cor, annotation_col = sample_annotation, annotation_row = sample_annotation,
+         main = "Sample correlation", border_color = NA)
+```
+
+```{r dispersion-plot, eval=INPUTS_AVAILABLE, fig.cap="Figure 3. DESeq2 dispersion estimates."}
+png(file.path(OUTDIR, "DESeq2_dispersion_plot.png"), width = 2000, height = 1600, res = 250)
+plotDispEsts(dds)
+dev.off()
+
+plotDispEsts(dds)
+```
+
+## Per-cell-line contrast function
+
+The function below is applied once per cell line to extract the
+itraconazole-versus-control contrast, classify genes at
+**padj < PADJ_THRESHOLD (0.05)** and **|log2FC| > LFC_THRESHOLD (1)**, and
+write all result tables and figures for that contrast.
+
+```{r contrast-function, eval=INPUTS_AVAILABLE}
+run_contrast <- function(cell_line, treated_group, control_group) {
+
+  comparison_name <- paste0(cell_line, "_itraconazole_vs_control")
+  contrast_dir <- file.path(OUTDIR, comparison_name)
+  dir.create(contrast_dir, recursive = TRUE, showWarnings = FALSE)
+
+  # --- DESeq2 results ------------------------------------------------------
+  res <- results(dds, contrast = c("group", treated_group, control_group), alpha = PADJ_THRESHOLD)
+  res <- res[order(res$padj), ]
+
+  df <- as.data.frame(res)
+  df$gene_id <- rownames(df)
+  df$ensembl_gene_id <- sub("\\..*$", "", df$gene_id)
+  ai <- match(df$gene_id, gene_annotation$gene_id)
+  df$gene_symbol <- gene_annotation$gene_symbol[ai]
+  df$gene_type   <- gene_annotation$gene_type[ai]
+
+  df$status <- "Not_significant"
+  df$status[!is.na(df$padj) & df$padj < PADJ_THRESHOLD & df$log2FoldChange >=  LFC_THRESHOLD] <- "Upregulated"
+  df$status[!is.na(df$padj) & df$padj < PADJ_THRESHOLD & df$log2FoldChange <= -LFC_THRESHOLD] <- "Downregulated"
+
+  df <- df[, c("gene_id","ensembl_gene_id","gene_symbol","gene_type",
+               "baseMean","log2FoldChange","lfcSE","stat","pvalue","padj","status")]
+
+  write.csv(df, file.path(contrast_dir, "all_DESeq2_results.csv"), row.names = FALSE)
+
+  significant   <- df[df$status != "Not_significant", ]
+  upregulated   <- df[df$status == "Upregulated", ]
+  downregulated <- df[df$status == "Downregulated", ]
+
+  write.csv(significant,   file.path(contrast_dir, "significant_DEGs.csv"),   row.names = FALSE)
+  write.csv(upregulated,   file.path(contrast_dir, "upregulated_DEGs.csv"),   row.names = FALSE)
+  write.csv(downregulated, file.path(contrast_dir, "downregulated_DEGs.csv"), row.names = FALSE)
+
+  summary_table <- data.frame(
+    Comparison = comparison_name,
+    Upregulated = nrow(upregulated),
+    Downregulated = nrow(downregulated),
+    Total_significant = nrow(significant),
+    padj_threshold = PADJ_THRESHOLD,
+    abs_log2FC_threshold = LFC_THRESHOLD
+  )
+  write.table(summary_table, file.path(contrast_dir, "DEG_summary.tsv"),
+              sep = "\t", row.names = FALSE, quote = FALSE)
+
+  # --- MA plot ---------------------------------------------------------
+  png(file.path(contrast_dir, "MA_plot.png"), width = 2000, height = 1600, res = 250)
+  plotMA(res, alpha = PADJ_THRESHOLD, ylim = c(-6, 6), main = comparison_name)
+  dev.off()
+
+  # --- volcano plot ------------------------------------------------------
+  volcano <- df[!is.na(df$padj) & !is.na(df$log2FoldChange), ]
+  volcano$minus_log10_padj <- -log10(pmax(volcano$padj, .Machine$double.xmin))
+  volcano$plot_label <- volcano$gene_symbol
+  missing_lab <- is.na(volcano$plot_label) | volcano$plot_label == ""
+  volcano$plot_label[missing_lab] <- volcano$ensembl_gene_id[missing_lab]
+
+  top_label_genes <- volcano[volcano$status != "Not_significant", ]
+  top_label_genes <- head(top_label_genes[order(top_label_genes$padj), ], TOP_VOLCANO_LABELS)
+
+  volcano_plot <- ggplot(volcano, aes(log2FoldChange, minus_log10_padj, colour = status)) +
+    geom_point(alpha = 0.55, size = 1.3) +
+    geom_vline(xintercept = c(-LFC_THRESHOLD, LFC_THRESHOLD), linetype = "dashed") +
+    geom_hline(yintercept = -log10(PADJ_THRESHOLD), linetype = "dashed") +
+    geom_text_repel(data = top_label_genes, aes(label = plot_label), size = 3,
+                     max.overlaps = Inf, show.legend = FALSE) +
+    xlab("log2 fold change") + ylab("-log10 adjusted p-value") +
+    ggtitle(paste(cell_line, "Itraconazole vs Control")) +
+    theme_bw(base_size = 12)
+
+  ggsave(file.path(contrast_dir, "volcano_plot.png"), volcano_plot, width = 8, height = 7, dpi = 300)
+
+  # --- top-50 DEG heatmap (restricted to this cell line's samples) -------
+  sig_ids <- rownames(res)[!is.na(res$padj) & res$padj < PADJ_THRESHOLD &
+                              abs(res$log2FoldChange) >= LFC_THRESHOLD]
+  sig_ids <- sig_ids[order(res[sig_ids, ]$padj)]
+
+  if (length(sig_ids) > 0) {
+    top_ids <- head(sig_ids, TOP_HEATMAP_GENES)
+    ti <- match(top_ids, gene_annotation$gene_id)
+    heatmap_labels <- gene_annotation$gene_symbol[ti]
+    missing_hl <- is.na(heatmap_labels) | heatmap_labels == ""
+    heatmap_labels[missing_hl] <- sub("\\..*$", "", top_ids[missing_hl])
+
+    selected_samples <- rownames(meta)[meta$cell_line == cell_line]
+    heatmap_matrix <- assay(vsd)[top_ids, selected_samples, drop = FALSE]
+    heatmap_annotation <- data.frame(Condition = meta[selected_samples, "condition", drop = TRUE])
+    rownames(heatmap_annotation) <- selected_samples
+
+    png(file.path(contrast_dir, "top50_DEG_heatmap.png"), width = 2400, height = 2800, res = 250)
+    pheatmap(heatmap_matrix, scale = "row", annotation_col = heatmap_annotation,
+             labels_row = heatmap_labels, show_rownames = TRUE, fontsize_row = 7,
+             border_color = NA, main = paste("Top DEGs:", comparison_name))
+    dev.off()
+  }
+
+  cat(sprintf("\n%s -> Upregulated: %d | Downregulated: %d | Total significant: %d\n",
+              comparison_name, nrow(upregulated), nrow(downregulated), nrow(significant)))
+
+  invisible(list(summary = summary_table, plot = volcano_plot, results = df))
+}
+```
+
+## Run the HT55 and SW948 contrasts
+
+```{r run-contrasts, eval=INPUTS_AVAILABLE}
+ht55_result  <- run_contrast("HT55",  "HT55_itraconazole",  "HT55_control")
+sw948_result <- run_contrast("SW948", "SW948_itraconazole", "SW948_control")
+
+combined_summary <- rbind(ht55_result$summary, sw948_result$summary)
+write.table(combined_summary, file.path(OUTDIR, "all_comparisons_summary.tsv"),
+            sep = "\t", row.names = FALSE, quote = FALSE)
+knitr::kable(combined_summary, caption = "Differential expression summary, both cell lines.")
+```
+
+```{r ht55-volcano-display, eval=INPUTS_AVAILABLE, fig.cap="Figure 4. HT55 itraconazole vs control volcano plot."}
+ht55_result$plot
+```
+
+```{r ht55-top-genes, eval=INPUTS_AVAILABLE}
+top_up   <- head(ht55_result$results[ht55_result$results$status == "Upregulated", ], TOP_VOLCANO_LABELS)
+top_down <- head(ht55_result$results[ht55_result$results$status == "Downregulated", ], TOP_VOLCANO_LABELS)
+knitr::kable(rbind(top_up, top_down)[, c("gene_symbol","log2FoldChange","padj","status")],
+             digits = 3, row.names = FALSE,
+             caption = "Table. Top 10 up- and downregulated genes, HT55 itraconazole vs control.")
+```
+
+---
+
+# Reproducibility
+
+## Software environment
+
+```{r session-info}
+sessionInfo()
+```
+
+## Minimal reproducing environment
+
+```{bash env-setup, eval=FALSE}
+# Command-line tools (conda/mamba, bioconda channel)
+mamba create -n srp144496 -c bioconda -c conda-forge \
+  fastqc multiqc hisat2 samtools subread wget gzip awk r-base
+conda activate srp144496
+
+# R / Bioconductor packages
+Rscript -e 'if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+             BiocManager::install(c("DESeq2", "ggplot2", "pheatmap", "ggrepel"))'
+```

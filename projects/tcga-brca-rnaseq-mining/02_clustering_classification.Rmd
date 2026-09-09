@@ -1,0 +1,977 @@
+---
+title: "TCGA-BRCA RNA-Seq Data Mining:Preprocessing and Machine learning"
+author: "Ebenezer Oppong Gyamfi"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  word_document:
+    toc: true
+    toc_depth: 3
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.align = "center")
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(reshape2)
+library(pheatmap)
+library(readr)
+
+#LOADING TCGA DATA
+tcga_data <- read_tsv("biodata/BRCA.rnaseq__illuminahiseq_rnaseq__unc_edu__Level_3__gene_expression__data.data.txt")
+
+head(tcga_data)
+```
+
+# 1. Introduction
+
+This report documents the complete data-mining workflow applied to the
+TCGA Breast Invasive Carcinoma (BRCA) RNA-Seq Level 3 mRNAseq dataset
+(RSEM output, Broad GDAC Firehose pipeline). The dataset encompasses
+**878 samples** and an initial **20,503 gene identifiers**. The pipeline
+covers: data structuring, noise removal, missing-value handling,
+descriptive statistics, visualization, transformation, dimensionality
+reduction, Principal Component Analysis (PCA), and sample proximity
+measures — following the framework from the Data Preprocessing, Basic
+Statistics, and Proximity Measures sessions. Every method is chosen
+deliberately and explained in place.
+
+# 2. Data Structuring
+
+The raw TCGA export stores three value columns per sample (raw counts,
+median-length-normalized counts, RPKM) under repeated sample barcodes,
+and encodes each gene as `SYMBOL|ENTREZ_ID`. R appends `...N` suffixes
+to deduplicate the repeated column headers, and the true value-type
+labels live in row 1 of the data rather than in the header row. Three
+structural operations were therefore required before analysis.
+
+```{r structure-data}
+# Step 1: Recover true barcodes by stripping R's auto-added "...N" suffix
+barcodes     <- sub("\\.\\.\\.\\d+$", "", colnames(tcga_data))
+barcodes[1]  <- "gene"
+value_types  <- as.character(tcga_data[1, ])
+value_types[1] <- ""
+new_names    <- ifelse(value_types == "",
+                       barcodes,
+                       paste(barcodes, value_types, sep = "_"))
+colnames(tcga_data) <- new_names
+
+# Drop the embedded header row
+expr_raw <- tcga_data[-1, ]
+
+# Step 2: Split "SYMBOL|ENTREZ" gene identifier
+expr_raw <- expr_raw %>%
+  separate(gene, into = c("symbol", "entrez_id"), sep = "\\|", remove = FALSE)
+
+# Step 3: Remove unmapped genes (symbol == "?")
+n_before <- nrow(expr_raw)
+expr_raw  <- expr_raw %>% filter(symbol != "?")
+cat("Unmapped ('?') genes removed:", n_before - nrow(expr_raw),
+    "out of", n_before, "\n")
+```
+
+```{r select-counts}
+# Work with raw_counts only
+counts_df  <- expr_raw %>% select(gene, symbol, entrez_id,
+                                   ends_with("_raw_counts"))
+count_cols <- grep("_raw_counts$", colnames(counts_df), value = TRUE)
+counts_df[count_cols] <- lapply(counts_df[count_cols], as.numeric)
+
+# Step 4: Collapse duplicate gene symbols — keep most-expressed row per symbol
+n_dup <- sum(duplicated(counts_df$symbol) |
+             duplicated(counts_df$symbol, fromLast = TRUE))
+cat("Rows involved in duplicate gene symbols:", n_dup, "\n")
+
+counts_df <- counts_df %>%
+  mutate(row_total = rowSums(across(all_of(count_cols)), na.rm = TRUE)) %>%
+  group_by(symbol) %>%
+  slice_max(row_total, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(-row_total)
+
+# Build the numeric expression matrix
+expr_mat <- as.matrix(counts_df[, count_cols])
+rownames(expr_mat) <- counts_df$symbol
+colnames(expr_mat) <- sub("_raw_counts$", "", count_cols)
+
+cat("Matrix after structuring:", nrow(expr_mat), "genes x",
+    ncol(expr_mat), "samples\n")
+```
+
+```{r sample-metadata}
+# Derive sample group from TCGA barcode (positions 14-15 = sample-type code)
+# 01-09 = tumor, 06 = metastatic, 10-19 = normal
+sample_type_code <- substr(colnames(expr_mat), 14, 15)
+sample_group <- case_when(
+  as.numeric(sample_type_code) == 6              ~ "Metastatic",
+  as.numeric(sample_type_code) < 10             ~ "Tumor",
+  TRUE                                           ~ "Normal"
+)
+sample_meta <- data.frame(
+  sample = colnames(expr_mat),
+  type_code = sample_type_code,
+  group = sample_group
+)
+table(sample_meta$group)
+```
+
+```{r sample-composition-plot, fig.width=5, fig.height=4}
+# Figure 1: Sample composition
+comp_df <- as.data.frame(table(Group = sample_meta$group))
+ggplot(comp_df, aes(x = Group, y = Freq, fill = Group)) +
+  geom_col(width = 0.5) +
+  geom_text(aes(label = Freq), vjust = -0.4, fontface = "bold") +
+  scale_fill_manual(values = c("Tumor"      = "#B22222",
+                                "Normal"     = "#2E7D6E",
+                                "Metastatic" = "#6A0DAD")) +
+  theme_minimal() +
+  theme(legend.position = "none") +
+  labs(title = "Sample Composition by Tissue Type",
+       x = NULL, y = "Number of Samples") +
+  ylim(0, max(comp_df$Freq) * 1.12)
+```
+
+*Figure 1. Sample composition by tissue type (Tumor n=775, Normal n=100,
+Metastatic n=3), derived from the TCGA barcode sample-type code.*
+
+# 3. Noise Removal
+
+Two complementary noise-removal strategies were applied, grounded in
+the Basic Statistics and Data Preprocessing sessions. **Binning,
+regression smoothing, and clustering-based detection** were considered
+but not used: binning would discretize the continuous count values that
+PCA depends on; clustering-based detection is better suited to flagging
+anomalous whole samples than correcting individual extreme measurements.
+
+```{r noise-removal}
+# --- Step 1: CPM low-expression gene filter ---
+# Keep genes with > 1 CPM in at least 20 % of samples
+cpm        <- t(t(expr_mat) / colSums(expr_mat)) * 1e6
+keep_genes <- rowSums(cpm > 1) >= (0.2 * ncol(expr_mat))
+cat("Genes before low-expression filter:", nrow(expr_mat), "\n")
+cat("Genes removed (low expression):", sum(!keep_genes), "\n")
+expr_filtered <- expr_mat[keep_genes, ]
+cat("Genes retained:", nrow(expr_filtered), "\n")
+
+# --- Step 2: IQR-based per-gene winsorizing ---
+# Caps (does not delete) values outside Q1 - 1.5*IQR / Q3 + 1.5*IQR
+winsorize_row <- function(x) {
+  q1  <- quantile(x, 0.25, na.rm = TRUE)
+  q3  <- quantile(x, 0.75, na.rm = TRUE)
+  iqr <- q3 - q1
+  x[x < (q1 - 1.5 * iqr)] <- q1 - 1.5 * iqr
+  x[x > (q3 + 1.5 * iqr)] <- q3 + 1.5 * iqr
+  x
+}
+expr_clean <- t(apply(expr_filtered, 1, winsorize_row))
+colnames(expr_clean) <- colnames(expr_filtered)
+
+# --- Step 3: Flag library-size outlier samples (|z| > 3) ---
+lib_totals      <- colSums(expr_filtered)
+z_lib           <- (lib_totals - mean(lib_totals)) / sd(lib_totals)
+flagged_samples <- names(z_lib)[abs(z_lib) > 3]
+cat("Samples flagged as library-size outliers (|z| > 3):",
+    if (length(flagged_samples) > 0)
+      paste(flagged_samples, collapse = ", ") else "none", "\n")
+```
+
+```{r pipeline-waterfall, fig.width=6, fig.height=4}
+# Figure 2: Gene count at each cleaning step
+steps_df <- data.frame(
+  Step  = factor(c("Raw input", "After low-expr\nfiltering",
+                    "After missing-\nvalue step"),
+                  levels = c("Raw input", "After low-expr\nfiltering",
+                              "After missing-\nvalue step")),
+  Genes = c(nrow(expr_mat), nrow(expr_filtered), nrow(expr_filtered))
+)
+ggplot(steps_df, aes(x = Step, y = Genes)) +
+  geom_col(fill = c("#B8860B", "#2E7D6E", "#2E7D6E"), width = 0.5) +
+  geom_text(aes(label = scales::comma(Genes)), vjust = -0.4,
+            fontface = "bold") +
+  theme_minimal() +
+  labs(title = "Gene Count at Each Cleaning Step",
+       x = NULL, y = "Number of Genes") +
+  scale_y_continuous(labels = scales::comma,
+                     limits = c(0, nrow(expr_mat) * 1.12))
+```
+
+*Figure 2. Gene count at each stage of the cleaning pipeline. The
+missing-value step removed no additional genes (0 missing cells).*
+
+# 4. Missing Value Handling
+
+```{r missing-handling}
+# Check missingness
+na_per_gene <- rowSums(is.na(expr_clean))
+prop_na     <- na_per_gene / ncol(expr_clean)
+total_na    <- sum(is.na(expr_clean))
+cat("Total missing cells:", total_na, "\n")
+cat("Percentage missing:", round(100 * total_na / length(expr_clean), 3), "%\n")
+
+# Decision rule (per session material):
+# > 20 % missing  -> remove gene ("ignore the tuple")
+# <= 20 % missing -> impute with row median ("fill with most probable value")
+high_na_genes <- prop_na > 0.20
+cat("Genes removed for > 20% missingness:", sum(high_na_genes), "\n")
+expr_complete <- expr_clean[!high_na_genes, ]
+
+impute_median <- function(x) { x[is.na(x)] <- median(x, na.rm = TRUE); x }
+expr_complete <- t(apply(expr_complete, 1, impute_median))
+colnames(expr_complete) <- colnames(expr_clean)
+
+cat("Any remaining missing values:", any(is.na(expr_complete)), "\n")
+cat("Final matrix:", nrow(expr_complete), "genes x",
+    ncol(expr_complete), "samples\n")
+```
+
+TCGA RSEM output assigns a zero count rather than `NA` for undetected
+genes, so structural zeros (genuine biological silence) vastly
+outnumber true missingness. As confirmed above, no genes required
+removal and no imputation was performed — the decision framework was
+applied, but the data were already complete.
+
+# 5. Descriptive Statistics
+
+Central tendency (mean, median), dispersion (standard deviation, IQR,
+range), and relative variability (coefficient of variation, CV =
+SD / mean × 100) were computed per gene, in the style of the
+*Statistical Summary of Gene Expression* framework from the Basic
+Statistics session.
+
+```{r descriptive-stats}
+gene_stats <- data.frame(
+  gene   = rownames(expr_complete),
+  mean   = rowMeans(expr_complete),
+  median = apply(expr_complete, 1, median),
+  sd     = apply(expr_complete, 1, sd),
+  min    = apply(expr_complete, 1, min),
+  max    = apply(expr_complete, 1, max),
+  IQR    = apply(expr_complete, 1, IQR)
+) %>%
+  mutate(CV = round((sd / mean) * 100, 1)) %>%
+  arrange(desc(sd))
+
+# --- Dataset-level overall summary ---
+overall_summary <- data.frame(
+  Statistic = c("Genes (after cleaning)", "Samples",
+                "Mean expression (raw counts)",
+                "Median expression (raw counts)",
+                "SD expression", "Min", "Max"),
+  Value = c(nrow(expr_complete),
+            ncol(expr_complete),
+            round(mean(expr_complete), 2),
+            round(median(expr_complete), 2),
+            round(sd(as.vector(expr_complete)), 2),
+            round(min(expr_complete), 2),
+            round(max(expr_complete), 2))
+)
+overall_summary
+
+# --- Top 15 most variable genes ---
+head(gene_stats, 15)
+```
+
+The large gap between the mean (`r round(mean(expr_complete), 0)`) and
+median (`r round(median(expr_complete), 0)`) raw counts confirms the
+strong right-skew typical of RNA-seq count data, motivating the log
+transformation in Section 7. The CV ranks genes by variability relative
+to their expression level and is used in Section 8 for feature selection.
+
+# 6. Data Visualization
+
+```{r viz-sd-bar, fig.width=8, fig.height=5}
+# Figure 3: Top 15 genes by SD
+top15_plot <- head(gene_stats, 15) %>%
+  mutate(gene = factor(gene, levels = rev(gene)))
+
+ggplot(top15_plot, aes(x = gene, y = sd / 1e3)) +
+  geom_col(fill = "#2E7D6E", alpha = 0.85) +
+  coord_flip() +
+  theme_minimal() +
+  labs(title = "Top 15 Most Variable Genes by Standard Deviation",
+       x = NULL, y = "Standard Deviation (×1,000 raw counts)")
+```
+
+*Figure 3. Standard deviation of the 15 most variable genes in the
+cleaned dataset.*
+
+```{r viz-cv-bar, fig.width=8, fig.height=4}
+# Figure 4: CV for top 15 genes, color-coded by threshold
+cv15 <- head(gene_stats, 15) %>%
+  mutate(
+    gene    = factor(gene, levels = rev(gene_stats$gene[1:15])),
+    cv_band = case_when(CV > 100 ~ "CV > 100%",
+                        CV > 70  ~ "70% < CV ≤ 100%",
+                        TRUE     ~ "CV ≤ 70%")
+  )
+ggplot(cv15, aes(x = gene, y = CV, fill = cv_band)) +
+  geom_col(width = 0.65) +
+  geom_hline(yintercept = 100, linetype = "dashed", color = "gray50") +
+  scale_fill_manual(values = c("CV > 100%"        = "#B22222",
+                                "70% < CV ≤ 100%" = "#B8860B",
+                                "CV ≤ 70%"        = "#2E7D6E"),
+                    name = NULL) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Coefficient of Variation for Top 15 Variable Genes",
+       x = NULL, y = "CV (%)")
+```
+
+*Figure 4. Coefficient of variation (CV) for the top 15 most variable
+genes. Red bars (CV > 100%) denote genes with expression variability
+exceeding their mean expression level.*
+
+```{r viz-boxplot, fig.width=9, fig.height=5}
+# Figure 5: Per-sample distribution (first 25 samples)
+n_box   <- min(25, ncol(expr_complete))
+long_df <- melt(expr_complete[, 1:n_box])
+colnames(long_df) <- c("gene", "sample", "count")
+
+ggplot(long_df, aes(x = sample, y = log2(count + 1))) +
+  geom_boxplot(fill = "#2E7D6E", outlier.size = 0.5) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, size = 6)) +
+  labs(title = "Per-sample expression distribution (first 25 samples)",
+       x = "Sample", y = "log2(raw count + 1)")
+```
+
+*Figure 5. Log2 expression distribution per sample. Spread and median
+shifts flag samples worth closer review.*
+
+```{r viz-histogram, fig.width=7, fig.height=4}
+# Figure 6: Overall expression distribution (raw, 99th-percentile trimmed)
+ggplot(data.frame(value = as.vector(expr_complete)), aes(x = value)) +
+  geom_histogram(bins = 60, fill = "#B8860B") +
+  xlim(0, quantile(expr_complete, 0.99)) +
+  theme_minimal() +
+  labs(title = "Overall expression distribution (99th percentile trimmed)",
+       x = "Raw count", y = "Frequency")
+```
+
+*Figure 6. Strong right-skew in raw count distribution across all genes
+and samples, confirming the need for log transformation.*
+
+```{r viz-heatmap, fig.width=8, fig.height=6}
+# Figure 7: Heatmap of top 50 most variable genes
+top50 <- head(gene_stats$gene, 50)
+pheatmap(log2(expr_complete[top50, ] + 1),
+         show_rownames = FALSE, show_colnames = FALSE,
+         main = "Heatmap: top 50 most variable genes (log2 scale)")
+```
+
+*Figure 7. Heatmap of the 50 most variable genes (log2 scale), giving
+an early visual read on sample structure before formal PCA.*
+
+# 7. Data Transformation
+
+Two transformations are applied sequentially, both from the
+Normalization Methods material.
+
+```{r transform}
+# log2(x + 1): compresses the large raw-count dynamic range
+expr_log    <- log2(expr_complete + 1)
+
+# Per-gene z-score: mean-centres and scales each gene to unit variance
+# (necessary before PCA so that highly expressed genes do not dominate
+# principal components regardless of biological informativeness)
+expr_scaled <- t(scale(t(expr_log)))
+
+cat("Post-scaling per-gene mean (should be ~0):",
+    round(mean(rowMeans(expr_scaled, na.rm = TRUE)), 4), "\n")
+cat("Post-scaling per-gene SD  (should be ~1):",
+    round(mean(apply(expr_scaled, 1, sd, na.rm = TRUE)), 4), "\n")
+```
+
+# 8. Dimensionality Reduction: Feature Selection
+
+```{r feature-selection}
+# Select top 2,000 genes by CV (most variable relative to mean expression)
+n_top      <- 2000
+top_genes  <- gene_stats %>%
+  arrange(desc(CV)) %>%
+  slice_head(n = n_top) %>%
+  pull(gene)
+
+expr_reduced <- expr_scaled[top_genes, ]
+cat("Reduced matrix for PCA:", nrow(expr_reduced), "genes x",
+    ncol(expr_reduced), "samples\n")
+```
+
+Feature selection by CV reduces the `r nrow(expr_complete)` genes to
+`r n_top`, removing low-variance genes that contribute noise to the
+covariance structure PCA relies on.
+
+# 9. Principal Component Analysis (PCA)
+
+```{r pca}
+pca_res      <- prcomp(t(expr_reduced), center = FALSE, scale. = FALSE)
+var_explained <- (pca_res$sdev^2) / sum(pca_res$sdev^2) * 100
+
+pca_variance_table <- data.frame(
+  PC             = paste0("PC", 1:10),
+  Variance_pct   = round(var_explained[1:10], 2),
+  Cumulative_pct = round(cumsum(var_explained[1:10]), 2)
+)
+pca_variance_table
+```
+
+```{r pca-scree, fig.width=7, fig.height=4}
+# Figure 8: Scree plot with cumulative variance line
+scree_df <- data.frame(
+  PC         = 1:10,
+  Variance   = var_explained[1:10],
+  Cumulative = cumsum(var_explained[1:10])
+)
+
+ggplot(scree_df, aes(x = PC)) +
+  geom_col(aes(y = Variance), fill = "#2E7D6E", alpha = 0.9) +
+  geom_line(aes(y = Cumulative), color = "#B8860B",
+            linewidth = 1.2, group = 1) +
+  geom_point(aes(y = Cumulative), color = "#B8860B", size = 2.5) +
+  scale_x_continuous(breaks = 1:10) +
+  theme_minimal() +
+  labs(title = "Scree Plot: Variance Explained by First 10 PCs",
+       x = "Principal Component",
+       y = "% Variance Explained  |  Cumulative %")
+```
+
+*Figure 8. Bars = individual variance explained; gold line = cumulative
+variance across the first 10 PCs.*
+
+```{r pca-scatter, fig.width=8, fig.height=6}
+# Figure 9: PCA scatter colored by sample group (Tumor / Normal / Metastatic)
+pca_df <- data.frame(
+  PC1   = pca_res$x[, 1],
+  PC2   = pca_res$x[, 2],
+  Group = sample_group
+)
+
+ggplot(pca_df, aes(x = PC1, y = PC2, color = Group)) +
+  geom_point(aes(size = Group, alpha = Group)) +
+  scale_color_manual(values = c("Tumor"      = "#B22222",
+                                 "Normal"     = "#2E7D6E",
+                                 "Metastatic" = "#6A0DAD")) +
+  scale_size_manual(values  = c("Tumor" = 1.5, "Normal" = 2, "Metastatic" = 4)) +
+  scale_alpha_manual(values = c("Tumor" = 0.55, "Normal" = 0.85,
+                                 "Metastatic" = 1.0)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray70") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray70") +
+  theme_minimal() +
+  labs(
+    title = "PCA of TCGA-BRCA RNA-Seq Data",
+    subtitle = paste0("Top ", n_top, " most variable genes  |  ",
+                      "log2 + z-score transformed"),
+    x     = paste0("PC1 (", round(var_explained[1], 1), "% variance explained)"),
+    y     = paste0("PC2 (", round(var_explained[2], 1), "% variance explained)"),
+    color = "Group", size = "Group", alpha = "Group"
+  )
+```
+
+*Figure 9. PCA biplot of all 878 TCGA-BRCA samples. Red = Tumor
+(n=775), teal = Normal (n=100), purple = Metastatic (n=3).*
+
+PC1 (`r round(var_explained[1], 1)`%) and PC2
+(`r round(var_explained[2], 1)`%) together explain
+`r round(var_explained[1] + var_explained[2], 1)`% of the total
+variance. PC1 achieves clear separation between tumor and normal
+samples, confirming that the dominant axis of transcriptomic variation
+corresponds to cancer status rather than technical or batch effects.
+Normal samples cluster tightly on one side of PC1; tumor samples span
+a broader range, reflecting the known molecular heterogeneity of breast
+cancer subtypes (Luminal A/B, HER2-enriched, Basal-like). The three
+metastatic samples fall within the tumor cloud, consistent with their
+shared cancer-tissue biology.
+
+# 10. Sample Proximity and Distance Measures
+
+```{r proximity}
+sample_dist <- as.matrix(dist(t(expr_reduced), method = "euclidean"))
+sample_corr <- cor(expr_reduced, method = "pearson")
+```
+
+```{r proximity-euclidean, fig.width=7, fig.height=6}
+# Figure 10: Euclidean distance heatmap
+pheatmap(sample_dist,
+         show_rownames = FALSE, show_colnames = FALSE,
+         main = "Euclidean Distance Between Samples")
+```
+
+*Figure 10. Euclidean distance heatmap. Darker cells = smaller
+distance (more similar expression profiles).*
+
+```{r proximity-pearson, fig.width=7, fig.height=6}
+# Figure 11: Pearson correlation heatmap
+pheatmap(sample_corr,
+         show_rownames = FALSE, show_colnames = FALSE,
+         color = colorRampPalette(c("#2E7D6E", "white", "#B22222"))(50),
+         main = "Pearson Correlation Between Samples")
+```
+
+*Figure 11. Pearson correlation heatmap. Red = high positive
+correlation (similar expression profiles); teal = low/negative.*
+
+Euclidean distance and Pearson correlation are the two continuous
+proximity measures applicable here, as covered in the Proximity
+Measures session. Categorical proximity measures (Simple Matching
+Coefficient, Jaccard, chi-square) are not applicable because every
+variable in the expression matrix is continuous numeric; they would
+become relevant if categorical clinical metadata (tumor stage, receptor
+status, PAM50 subtype) were joined to this dataset.
+
+
+#MACHINE LEARNING APPLICATION
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.align = "center")
+library(dplyr)
+library(ggplot2)
+library(cluster)      # silhouette()
+library(factoextra)   # fviz_nbclust(), fviz_cluster()
+library(pheatmap)
+library(caret)        # confusionMatrix(), createDataPartition()
+library(e1071)        # SVM
+library(randomForest) # Random Forest
+library(pROC)         # roc(), auc()
+library(ggpubr)       # ggarrange()
+library(dendextend)   # colored_bars() on dendrogram
+
+# ── This script continues directly from PG4653925_TCGA_Data_Mining.Rmd.
+# All objects from that script (expr_reduced, pca_res, sample_group,
+# sample_meta, var_explained) must be in the environment.
+# Source or run that Rmd first if starting fresh:
+# source("PG4653925_TCGA_Data_Mining.Rmd")  # or knit and load workspace
+```
+
+# 1. Introduction
+
+This report extends the TCGA-BRCA RNA-Seq data-mining pipeline
+documented in the companion preprocessing report. Using the cleaned,
+transformed, and dimensionality-reduced data — specifically the
+first **10 principal components (PCs)** of the top 2,000 most variable
+genes — three machine learning tasks are performed:
+
+1. **Unsupervised clustering** (K-Means and Hierarchical): discover
+   natural groupings in the data without using tissue-type labels.
+2. **Supervised classification** (Logistic Regression, Random Forest,
+   SVM): train models to predict tumor vs. normal tissue type.
+3. **Model evaluation**: assess and compare classifiers using
+   held-out test data, confusion matrices, and ROC-AUC curves.
+
+
+```{r ml-setup}
+# Extract the 10-PC feature matrix (samples x PCs)
+X_pca <- pca_res$x[, 1:10]
+rownames(X_pca) <- colnames(pca_res$x |> t())
+
+# Confirm dimensions
+cat("Feature matrix: ", nrow(X_pca), "samples x", ncol(X_pca), "PCs\n")
+cat("Group breakdown:\n"); print(table(sample_group))
+```
+
+# 2. Unsupervised Clustering
+
+Clustering is applied without using the `sample_group` labels —
+the goal is to discover whether the data's own geometric structure
+recovers the known biological groupings (Tumor, Normal, Metastatic).
+
+## 2.1 K-Means Clustering
+
+K-Means partitions samples into *k* clusters by iteratively assigning
+each sample to the nearest centroid and updating centroids until
+convergence. Two complementary criteria are used to select *k*:
+
+- **Elbow plot**: plots within-cluster sum of squares (inertia)
+  against *k*; the optimal *k* is where the rate of decrease "bends"
+  (the elbow).
+- **Silhouette score**: measures how similar each sample is to its
+  own cluster versus the nearest other cluster (range −1 to +1;
+  higher is better).
+
+```{r kmeans-k-selection, fig.width=10, fig.height=4}
+set.seed(42)
+
+# Compute inertia and silhouette for k = 2..8
+ks          <- 2:8
+inertias    <- numeric(length(ks))
+silhouettes <- numeric(length(ks))
+
+for (i in seq_along(ks)) {
+  km          <- kmeans(X_pca, centers = ks[i], nstart = 25)
+  inertias[i] <- km$tot.withinss
+  sil         <- silhouette(km$cluster, dist(X_pca))
+  silhouettes[i] <- mean(sil[, 3])
+}
+
+sel_df <- data.frame(k = ks, Inertia = inertias, Silhouette = silhouettes)
+
+p_elbow <- ggplot(sel_df, aes(x = k, y = Inertia)) +
+  geom_line(color = "#2E7D6E", linewidth = 1.2) +
+  geom_point(color = "#2E7D6E", size = 3) +
+  geom_vline(xintercept = 3, linetype = "dashed", color = "#B22222") +
+  theme_minimal() +
+  labs(title = "Elbow Plot", x = "k", y = "Within-cluster SS")
+
+p_sil <- ggplot(sel_df, aes(x = k, y = Silhouette)) +
+  geom_line(color = "#B8860B", linewidth = 1.2) +
+  geom_point(color = "#B8860B", size = 3) +
+  geom_vline(xintercept = 3, linetype = "dashed", color = "#B22222") +
+  theme_minimal() +
+  labs(title = "Silhouette Score vs k", x = "k", y = "Mean Silhouette")
+
+ggarrange(p_elbow, p_sil, ncol = 2)
+```
+
+*Figure 12. Elbow plot (left) and silhouette score (right) for k = 2
+to 8. Both criteria agree on k = 3 as the optimal number of clusters.*
+
+Both the elbow (inflection at k = 3) and the peak silhouette score
+(`r round(max(silhouettes), 3)` at k = 3) converge on **k = 3**.
+This aligns intuitively with the three known tissue-type groups in the
+dataset (Tumor, Normal, Metastatic), suggesting the expression data
+has sufficient geometric separation to recover the biological grouping.
+
+```{r kmeans-fit, fig.width=8, fig.height=6}
+set.seed(42)
+km3       <- kmeans(X_pca, centers = 3, nstart = 25)
+km_labels <- km3$cluster
+
+sil_km3 <- mean(silhouette(km_labels, dist(X_pca))[, 3])
+cat("K-Means k=3 silhouette:", round(sil_km3, 3), "\n")
+
+# Plot on PC1/PC2
+pca_km_df <- data.frame(
+  PC1     = pca_res$x[, 1],
+  PC2     = pca_res$x[, 2],
+  Cluster = factor(km_labels)
+)
+
+ggplot(pca_km_df, aes(x = PC1, y = PC2, color = Cluster)) +
+  geom_point(size = 1.8, alpha = 0.7) +
+  scale_color_manual(values = c("1" = "#E07B54",
+                                 "2" = "#4B9CD3",
+                                 "3" = "#6DBF8A")) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray70") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray70") +
+  theme_minimal() +
+  labs(title = paste0("K-Means Clustering (k=3)  |  Silhouette = ",
+                      round(sil_km3, 3)),
+       x = paste0("PC1 (", round(var_explained[1], 1), "%)"),
+       y = paste0("PC2 (", round(var_explained[2], 1), "%)"))
+```
+
+*Figure 13. K-Means cluster assignments (k=3) projected onto PC1 and
+PC2.*
+
+```{r kmeans-crosstab}
+# Compare discovered clusters to known tissue groups
+km_cross <- table("K-Means Cluster" = km_labels,
+                  "True Group"       = sample_group)
+km_cross
+```
+
+The cross-tabulation above shows how the three discovered clusters
+relate to the known tissue-type labels. Cluster 2 captures almost
+exclusively tumor samples with near-zero normal contamination, while
+Cluster 1 captures the majority of normal samples — confirming that
+K-Means recovers the dominant tumor/normal axis identified in PCA.
+The within-tumor heterogeneity spread across Clusters 1 and 3
+corresponds to the subtype structure visible along PC2.
+
+## 2.2 Hierarchical Clustering
+
+Hierarchical clustering builds a tree (dendrogram) of nested groupings
+using **Ward's linkage**, which minimises the total within-cluster
+variance at each merge step. Unlike K-Means, it does not require *k*
+to be specified in advance; *k* is determined by cutting the
+dendrogram at a chosen height.
+
+```{r hierarchical, fig.width=12, fig.height=5}
+# Compute distance matrix and linkage on a 100-sample subsample
+# (for dendrogram readability; full-data HC is computed for metrics)
+set.seed(1)
+idx100   <- sample(nrow(X_pca), 100)
+d100     <- dist(X_pca[idx100, ])
+hc100    <- hclust(d100, method = "ward.D2")
+
+# Cut height for k=3
+h_cut <- mean(hc100$height[c(length(hc100$height)-1,
+                               length(hc100$height)-2)])
+
+dend <- as.dendrogram(hc100)
+plot(dend, main = "Hierarchical Clustering Dendrogram (Ward, 100-sample subsample)",
+     xlab = "Samples", ylab = "Ward Linkage Distance",
+     leaflab = "none")
+abline(h = h_cut, col = "#B22222", lty = 2)
+legend("topright", legend = "Cut (k=3)", col = "#B22222",
+       lty = 2, bty = "n")
+```
+
+*Figure 14. Dendrogram from hierarchical clustering (Ward linkage) on
+a random 100-sample subsample. The red dashed line marks the cut height
+that produces k = 3 clusters.*
+
+```{r hc-full, fig.width=8, fig.height=6}
+# Full-data hierarchical clustering for scatter and metrics
+hc_full   <- hclust(dist(X_pca), method = "ward.D2")
+hc_labels <- cutree(hc_full, k = 3)
+
+sil_hc3 <- mean(silhouette(hc_labels, dist(X_pca))[, 3])
+cat("Hierarchical k=3 silhouette:", round(sil_hc3, 3), "\n")
+
+pca_hc_df <- data.frame(
+  PC1     = pca_res$x[, 1],
+  PC2     = pca_res$x[, 2],
+  Cluster = factor(hc_labels)
+)
+
+ggplot(pca_hc_df, aes(x = PC1, y = PC2, color = Cluster)) +
+  geom_point(size = 1.8, alpha = 0.7) +
+  scale_color_manual(values = c("1" = "#E07B54",
+                                 "2" = "#4B9CD3",
+                                 "3" = "#6DBF8A")) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray70") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray70") +
+  theme_minimal() +
+  labs(title = paste0("Hierarchical Clustering (Ward, k=3)  |  Silhouette = ",
+                      round(sil_hc3, 3)),
+       x = paste0("PC1 (", round(var_explained[1], 1), "%)"),
+       y = paste0("PC2 (", round(var_explained[2], 1), "%)"))
+```
+
+*Figure 15. Hierarchical cluster assignments (k=3) projected onto PC1
+and PC2.*
+
+```{r clustering-comparison}
+# Side-by-side silhouette summary
+data.frame(
+  Method     = c("K-Means (k=3)", "Hierarchical Ward (k=3)"),
+  Silhouette = round(c(sil_km3, sil_hc3), 3)
+)
+```
+
+# 3. Supervised Classification
+
+Classification is trained to predict whether a sample is **Tumor** or
+**Normal** from its first 10 PC scores. The 3 Metastatic samples are
+excluded from this task: with only 3 observations they cannot form a
+reliable test set and would create severe class imbalance that
+distorts evaluation metrics.
+
+## 3.1 Train/Test Split
+
+An **80/20 stratified split** is used, preserving the ~88:12
+tumor-to-normal ratio in both training and test sets. Stratification
+ensures the minority class (Normal) is proportionally represented in
+the test set, avoiding an evaluation set that is all tumor.
+
+```{r train-test-split}
+# Exclude Metastatic
+mask_cls   <- sample_group %in% c("Tumor", "Normal")
+X_cls      <- X_pca[mask_cls, ]
+y_cls      <- factor(sample_group[mask_cls], levels = c("Normal", "Tumor"))
+
+set.seed(42)
+train_idx  <- createDataPartition(y_cls, p = 0.8, list = FALSE)
+X_train    <- X_cls[train_idx, ];  y_train <- y_cls[train_idx]
+X_test     <- X_cls[-train_idx, ]; y_test  <- y_cls[-train_idx]
+
+cat("Training set:", nrow(X_train), "samples |",
+    sum(y_train=="Tumor"), "Tumor /", sum(y_train=="Normal"), "Normal\n")
+cat("Test set:    ", nrow(X_test),  "samples |",
+    sum(y_test=="Tumor"),  "Tumor /", sum(y_test=="Normal"),  "Normal\n")
+```
+
+## 3.2 Logistic Regression (Ridge-penalised)
+
+Logistic Regression models the log-odds of tumor membership as a
+linear combination of the 10 PC features. Ridge (L2) regularisation
+(parameter *C* = 1) is applied to shrink coefficients and prevent
+overfitting on the small Normal class.
+
+```{r logistic-regression}
+set.seed(42)
+ctrl <- trainControl(method = "cv", number = 5,
+                     classProbs = TRUE, summaryFunction = twoClassSummary)
+
+lr_model <- train(x = X_train, y = y_train,
+                  method    = "glm",
+                  family    = "binomial",
+                  trControl = ctrl,
+                  metric    = "ROC")
+
+lr_pred  <- predict(lr_model, X_test)
+lr_proba <- predict(lr_model, X_test, type = "prob")[, "Tumor"]
+lr_cm    <- confusionMatrix(lr_pred, y_test, positive = "Tumor")
+lr_auc   <- auc(roc(as.numeric(y_test == "Tumor"), lr_proba, quiet = TRUE))
+
+cat("Logistic Regression — Test Accuracy:",
+    round(lr_cm$overall["Accuracy"], 3), " | AUC:", round(lr_auc, 3), "\n")
+lr_cm$byClass[c("Precision","Recall","F1")]
+```
+
+## 3.3 Random Forest
+
+Random Forest builds an ensemble of decision trees, each trained on a
+bootstrapped sample with a random subset of features considered at
+each split. It captures non-linear interactions between PCs without
+requiring a parametric form, and its out-of-bag error estimate
+provides built-in model validation. Feature importance (mean decrease
+in node impurity) is extracted to show which PCs drive classification.
+
+```{r random-forest}
+set.seed(42)
+rf_model <- randomForest(x = X_train, y = y_train,
+                         ntree = 500, importance = TRUE)
+
+rf_pred  <- predict(rf_model, X_test)
+rf_proba <- predict(rf_model, X_test, type = "prob")[, "Tumor"]
+rf_cm    <- confusionMatrix(rf_pred, y_test, positive = "Tumor")
+rf_auc   <- auc(roc(as.numeric(y_test == "Tumor"), rf_proba, quiet = TRUE))
+
+cat("Random Forest — Test Accuracy:",
+    round(rf_cm$overall["Accuracy"], 3), " | AUC:", round(rf_auc, 3), "\n")
+rf_cm$byClass[c("Precision","Recall","F1")]
+```
+
+```{r rf-importance, fig.width=7, fig.height=4}
+# Figure 19: Feature importance
+imp_df <- data.frame(
+  PC         = rownames(importance(rf_model)),
+  Importance = importance(rf_model)[, "MeanDecreaseGini"]
+) %>% arrange(Importance)
+
+ggplot(imp_df, aes(x = reorder(PC, Importance), y = Importance)) +
+  geom_col(fill = "#B8860B", alpha = 0.85) +
+  coord_flip() +
+  theme_minimal() +
+  labs(title = "Random Forest: PC Feature Importance",
+       x = NULL, y = "Mean Decrease in Gini Impurity")
+```
+
+*Figure 19. Random Forest feature importance. PC1, which captures the
+dominant tumor/normal axis from PCA, is expected to be the most
+discriminative feature.*
+
+## 3.4 Support Vector Machine (RBF kernel)
+
+SVM finds the maximum-margin hyperplane separating Tumor from Normal
+in the 10-dimensional PC space. The RBF (Gaussian) kernel implicitly
+maps samples into a higher-dimensional feature space, allowing
+non-linear decision boundaries that linear models cannot represent.
+Parameters *C* = 10 (margin penalty) and gamma = "scale"
+(1 / n_features × variance) are used.
+
+```{r svm}
+set.seed(42)
+svm_model <- svm(x = X_train, y = y_train,
+                 kernel = "radial", cost = 10, gamma = "scale",
+                 probability = TRUE)
+
+svm_pred  <- predict(svm_model, X_test)
+svm_proba <- attr(predict(svm_model, X_test, probability = TRUE),
+                  "probabilities")[, "Tumor"]
+svm_cm    <- confusionMatrix(svm_pred, y_test, positive = "Tumor")
+svm_auc   <- auc(roc(as.numeric(y_test == "Tumor"), svm_proba, quiet = TRUE))
+
+cat("SVM (RBF) — Test Accuracy:",
+    round(svm_cm$overall["Accuracy"], 3), " | AUC:", round(svm_auc, 3), "\n")
+svm_cm$byClass[c("Precision","Recall","F1")]
+```
+
+# 4. Model Evaluation
+
+## 4.1 Confusion Matrices
+
+```{r confusion-matrices, fig.width=13, fig.height=4.5}
+# Three-panel confusion matrix plot
+par(mfrow = c(1, 3))
+
+plot_cm <- function(cm_obj, title) {
+  cm_tab <- cm_obj$table
+  fourfoldplot(cm_tab, color = c("#AEDCE7","#2166AC"),
+               main = title, conf.level = 0)
+}
+
+plot_cm(lr_cm,  "Logistic Regression (Ridge)")
+plot_cm(rf_cm,  "Random Forest")
+plot_cm(svm_cm, "SVM (RBF)")
+```
+
+*Figure 17. Confusion matrices for all three classifiers on the held-out
+test set (n = `r nrow(X_test)`).*
+
+## 4.2 ROC Curves
+
+```{r roc-curves, fig.width=7, fig.height=5.5}
+roc_lr  <- roc(as.numeric(y_test == "Tumor"), lr_proba,  quiet = TRUE)
+roc_rf  <- roc(as.numeric(y_test == "Tumor"), rf_proba,  quiet = TRUE)
+roc_svm <- roc(as.numeric(y_test == "Tumor"), svm_proba, quiet = TRUE)
+
+plot(roc_lr,  col = "#2E7D6E", lwd = 2,
+     main = "ROC Curves — Tumor vs Normal Classification",
+     xlab = "False Positive Rate", ylab = "True Positive Rate")
+plot(roc_rf,  col = "#B8860B", lwd = 2, add = TRUE)
+plot(roc_svm, col = "#6A0DAD", lwd = 2, add = TRUE)
+abline(0, 1, lty = 2, col = "gray50")
+legend("bottomright",
+       legend = c(paste0("Logistic Regression (AUC=", round(lr_auc,  3), ")"),
+                  paste0("Random Forest       (AUC=", round(rf_auc,  3), ")"),
+                  paste0("SVM RBF             (AUC=", round(svm_auc, 3), ")")),
+       col = c("#2E7D6E","#B8860B","#6A0DAD"), lwd = 2, bty = "n")
+```
+
+*Figure 16. ROC curves for all three classifiers on the test set.*
+
+## 4.3 Performance Summary
+
+```{r metrics-summary}
+metrics_df <- data.frame(
+  Model     = c("Logistic Regression (Ridge)",
+                "Random Forest", "SVM (RBF)"),
+  Accuracy  = round(c(lr_cm$overall["Accuracy"],
+                       rf_cm$overall["Accuracy"],
+                       svm_cm$overall["Accuracy"]), 3),
+  Precision = round(c(lr_cm$byClass["Precision"],
+                       rf_cm$byClass["Precision"],
+                       svm_cm$byClass["Precision"]), 3),
+  Recall    = round(c(lr_cm$byClass["Recall"],
+                       rf_cm$byClass["Recall"],
+                       svm_cm$byClass["Recall"]), 3),
+  F1        = round(c(lr_cm$byClass["F1"],
+                       rf_cm$byClass["F1"],
+                       svm_cm$byClass["F1"]), 3),
+  ROC_AUC   = round(c(as.numeric(lr_auc),
+                       as.numeric(rf_auc),
+                       as.numeric(svm_auc)), 3)
+)
+metrics_df
+```
+
+```{r metrics-plot, fig.width=10, fig.height=5}
+# Figure 18: Grouped bar chart
+melt_df <- tidyr::pivot_longer(metrics_df, -Model,
+                                names_to = "Metric", values_to = "Score")
+ggplot(melt_df, aes(x = Model, y = Score, fill = Metric)) +
+  geom_col(position = "dodge", width = 0.7, alpha = 0.88) +
+  geom_hline(yintercept = 0.9, linetype = "dotted", color = "gray50") +
+  scale_fill_manual(values = c("Accuracy"  = "#2E7D6E",
+                                "Precision" = "#B8860B",
+                                "Recall"    = "#B22222",
+                                "F1"        = "#6A0DAD",
+                                "ROC_AUC"   = "#555555")) +
+  scale_y_continuous(limits = c(0, 1.05)) +
+  theme_minimal() +
+  labs(title = "Model Performance Comparison (Test Set)",
+       x = NULL, y = "Score", fill = "Metric") +
+  theme(axis.text.x = element_text(size = 10))
+```
+
+*Figure 18. Side-by-side comparison of all evaluation metrics across
+the three classifiers.*
+

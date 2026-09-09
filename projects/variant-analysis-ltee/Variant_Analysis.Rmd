@@ -1,0 +1,421 @@
+---
+title: "Variant Analysis Workflow"
+author: "Ebenezer Oppong Gyamfi"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    theme: flatly
+    df_print: paged
+---
+
+```{r global-options, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 8,
+  fig.height = 5
+)
+```
+
+# Overview
+
+This document contains the core stages of the LTEE Ara-3 variant-calling and
+annotation pipeline. Three whole-genome resequencing samples
+from population Ara-3 are processed against the ancestral REL606 reference:
+
+| Sample     | Generation | SRA run     |
+|------------|-----------:|-------------|
+| Ara3_5000  | 5,000      | SRR2589044  |
+| Ara3_15000 | 15,000     | SRR2584863  |
+| Ara3_50000 | 50,000     | SRR2584866  |
+
+
+
+# Environment Setup
+
+```{r libraries}
+library(tidyverse)   # data wrangling and plotting
+library(vcfR)         # VCF parsing
+library(VariantAnnotation)  # Bioconductor VCF/annotation utilities
+library(knitr)         # kable() tables
+library(DT)            # interactive datatable()
+library(jsonlite)       # optional metadata parsing
+```
+
+```{r paths}
+
+base_dir     <- "."
+metadata_tsv <- file.path(base_dir, "metadata/samples.tsv")
+vcf_dir      <- file.path(base_dir, "results/vcf")
+annot_dir    <- file.path(base_dir, "results/annotation")
+stats_dir    <- file.path(base_dir, "results/statistics")
+
+samples <- read_tsv(metadata_tsv, show_col_types = FALSE)
+kable(samples, caption = "Sample sheet (metadata/samples.tsv)")
+```
+
+# Pipeline Execution (Shell)
+
+## 1. Download raw reads (`01_download.sh`)
+
+```{bash download, eval=FALSE}
+set -euo pipefail
+RAW_DIR="data/raw"
+mkdir -p "$RAW_DIR"
+
+download_file () {
+    URL="$1"; OUTPUT="$2"
+    if [[ -s "$OUTPUT" ]]; then
+        echo "[SKIP] $OUTPUT already exists."
+    else
+        curl --fail --location --retry 5 --retry-delay 5 --output "$OUTPUT" "$URL"
+    fi
+}
+
+download_file "https://ftp.sra.ebi.ac.uk/vol1/fastq/SRR258/004/SRR2589044/SRR2589044_1.fastq.gz" "$RAW_DIR/SRR2589044_1.fastq.gz"
+download_file "https://ftp.sra.ebi.ac.uk/vol1/fastq/SRR258/004/SRR2589044/SRR2589044_2.fastq.gz" "$RAW_DIR/SRR2589044_2.fastq.gz"
+download_file "https://ftp.sra.ebi.ac.uk/vol1/fastq/SRR258/003/SRR2584863/SRR2584863_1.fastq.gz" "$RAW_DIR/SRR2584863_1.fastq.gz"
+download_file "https://ftp.sra.ebi.ac.uk/vol1/fastq/SRR258/003/SRR2584863/SRR2584863_2.fastq.gz" "$RAW_DIR/SRR2584863_2.fastq.gz"
+download_file "https://ftp.sra.ebi.ac.uk/vol1/fastq/SRR258/006/SRR2584866/SRR2584866_1.fastq.gz" "$RAW_DIR/SRR2584866_1.fastq.gz"
+download_file "https://ftp.sra.ebi.ac.uk/vol1/fastq/SRR258/006/SRR2584866/SRR2584866_2.fastq.gz" "$RAW_DIR/SRR2584866_2.fastq.gz"
+```
+
+## 2. Raw-read QC (`02_raw_qc.sh`)
+
+```{bash raw-qc, eval=FALSE}
+set -euo pipefail
+mkdir -p results/fastqc_raw results/multiqc/raw
+fastqc --threads 4 --outdir results/fastqc_raw data/raw/*.fastq.gz
+multiqc results/fastqc_raw --outdir results/multiqc/raw --force
+```
+
+## 3. Adapter/quality trimming (`03_trim.sh`)
+
+```{bash trim, eval=FALSE}
+set -euo pipefail
+TRIM_DIR="data/trimmed"
+UNPAIRED_DIR="${TRIM_DIR}/unpaired"
+STATS_DIR="results/statistics/trimming"
+mkdir -p "$TRIM_DIR" "$UNPAIRED_DIR" "$STATS_DIR"
+
+ADAPTERS=$(find "$CONDA_PREFIX" -type f -name "NexteraPE-PE.fa" 2>/dev/null | head -n 1)
+
+tail -n +2 metadata/samples.tsv |
+while IFS=$'\t' read -r SAMPLE GENERATION RUN R1 R2; do
+    OUT_R1="${TRIM_DIR}/${RUN}_1.trim.fastq.gz"
+    OUT_R2="${TRIM_DIR}/${RUN}_2.trim.fastq.gz"
+    OUT_U1="${UNPAIRED_DIR}/${RUN}_1.unpaired.fastq.gz"
+    OUT_U2="${UNPAIRED_DIR}/${RUN}_2.unpaired.fastq.gz"
+    SUMMARY="${STATS_DIR}/${RUN}.trimmomatic_summary.txt"
+
+    if [[ -s "$OUT_R1" && -s "$OUT_R2" ]]; then
+        echo "[SKIP] Trimmed paired reads already exist for $RUN"
+    else
+        trimmomatic PE -threads 4 -phred33 -summary "$SUMMARY" \
+            "$R1" "$R2" "$OUT_R1" "$OUT_U1" "$OUT_R2" "$OUT_U2" \
+            ILLUMINACLIP:"${ADAPTERS}":2:40:15 \
+            SLIDINGWINDOW:4:20 \
+            MINLEN:25
+    fi
+done
+
+seqkit stats "$TRIM_DIR"/*.trim.fastq.gz > "$STATS_DIR/trimmed_seqkit_stats.txt"
+```
+
+## 4. Post-trimming QC (`04_trimmed_qc.sh`)
+
+```{bash trimmed-qc, eval=FALSE}
+set -euo pipefail
+mkdir -p results/fastqc_trimmed results/multiqc/trimmed
+fastqc --threads 4 --outdir results/fastqc_trimmed data/trimmed/*.trim.fastq.gz
+multiqc results/fastqc_trimmed --outdir results/multiqc/trimmed --force
+```
+
+## 5. Reference genome preparation (`05_prepare_reference.sh`)
+
+```{bash reference, eval=FALSE}
+set -euo pipefail
+REF_DIR="data/reference"
+REF="${REF_DIR}/ecoli_rel606.fasta"
+REF_URL="https://ftp.ncbi.nlm.nih.gov/genomes/all/GCA/000/017/985/GCA_000017985.1_ASM1798v1/GCA_000017985.1_ASM1798v1_genomic.fna.gz"
+mkdir -p "$REF_DIR" results/statistics/reference
+
+if [[ ! -s "$REF" ]]; then
+    curl --fail --location --retry 5 --retry-delay 5 --output "${REF}.gz" "$REF_URL"
+    gunzip "${REF}.gz"
+fi
+
+seqkit stats "$REF" > results/statistics/reference/REL606_seqkit_stats.txt
+[[ -f "${REF}.bwt" ]] || bwa index "$REF"
+[[ -f "${REF}.fai" ]] || samtools faidx "$REF"
+```
+
+## 6. Alignment (`06_align.sh`)
+
+```{bash align, eval=FALSE}
+set -euo pipefail
+REF="data/reference/ecoli_rel606.fasta"
+TRIM_DIR="data/trimmed"
+BAM_DIR="results/bam"
+QC_DIR="results/statistics/alignment"
+mkdir -p "$BAM_DIR" "$QC_DIR"
+
+SUMMARY="${QC_DIR}/alignment_summary.tsv"
+printf "sample\tgeneration\trun\ttotal_reads\tmapped_reads\tmapping_percent\tproperly_paired\tproperly_paired_percent\tmean_depth\tbreadth_1x_percent\tbreadth_10x_percent\n" > "$SUMMARY"
+
+tail -n +2 metadata/samples.tsv |
+while IFS=$'\t' read -r SAMPLE GENERATION RUN RAW_R1 RAW_R2; do
+    R1="${TRIM_DIR}/${RUN}_1.trim.fastq.gz"
+    R2="${TRIM_DIR}/${RUN}_2.trim.fastq.gz"
+    BAM="${BAM_DIR}/${RUN}.aligned.sorted.bam"
+
+    if [[ ! -s "$BAM" ]]; then
+        bwa mem -t 4 -R "@RG\tID:${RUN}\tSM:${SAMPLE}\tPL:ILLUMINA" "$REF" "$R1" "$R2" |
+        samtools sort -@ 4 -o "$BAM" -
+    fi
+
+    samtools quickcheck -v "$BAM"
+    [[ -s "${BAM}.bai" ]] || samtools index -@ 4 "$BAM"
+    samtools flagstat -@ 4 "$BAM" > "${QC_DIR}/${RUN}.flagstat.txt"
+    samtools stats -@ 4 "$BAM" > "${QC_DIR}/${RUN}.samtools_stats.txt"
+    samtools depth -aa "$BAM" > "${QC_DIR}/${RUN}.depth.txt"
+done
+```
+
+## 7. Variant calling (`07_variant_calling.sh`)
+
+```{bash variant-calling, eval=FALSE}
+set -euo pipefail
+REF="data/reference/ecoli_rel606.fasta"
+BAM_DIR="results/bam"; BCF_DIR="results/bcf"; VCF_DIR="results/vcf"
+mkdir -p "$BCF_DIR" "$VCF_DIR"
+
+tail -n +2 metadata/samples.tsv |
+while IFS=$'\t' read -r SAMPLE GENERATION RUN R1 R2; do
+    BAM="${BAM_DIR}/${RUN}.aligned.sorted.bam"
+    RAW_BCF="${BCF_DIR}/${RUN}.raw.bcf"
+    RAW_VCF="${VCF_DIR}/${RUN}.raw.vcf.gz"
+    FILTERED_VCF="${VCF_DIR}/${RUN}.filtered.vcf.gz"
+
+    bcftools mpileup --threads 4 -Ou -f "$REF" -a FORMAT/AD,FORMAT/DP "$BAM" |
+        bcftools view -Ob -o "$RAW_BCF"
+
+    bcftools call --threads 4 --ploidy 1 -m -v -Oz -o "$RAW_VCF" "$RAW_BCF"
+    bcftools index -t "$RAW_VCF"
+
+    bcftools filter --threads 4 -e 'QUAL<20 || FORMAT/DP<10' -s LowQual -Oz -o "$FILTERED_VCF" "$RAW_VCF"
+    bcftools index -t "$FILTERED_VCF"
+
+    bcftools stats "$FILTERED_VCF" > "results/statistics/variants/${RUN}.bcftools_stats.txt"
+done
+```
+
+
+
+## 10. Functional annotation (`10_annotate_variants.sh`)
+
+```{bash annotate, eval=FALSE}
+set -euo pipefail
+VCF_DIR="results/vcf"; OUT_DIR="results/annotation"; STATS_DIR="results/statistics/annotation"
+mkdir -p "$OUT_DIR" "$STATS_DIR"
+
+tail -n +2 metadata/samples.tsv |
+while IFS=$'\t' read -r SAMPLE GENERATION RUN R1 R2; do
+    INPUT="${VCF_DIR}/${RUN}.PASS.norm.vcf.gz"
+    OUTPUT="${OUT_DIR}/${RUN}.annotated.vcf.gz"
+
+    snpEff -c snpeff/snpEff.config -v \
+        -stats "${STATS_DIR}/${RUN}.snpeff_summary.html" \
+        -csvStats "${STATS_DIR}/${RUN}.snpeff_stats.csv" \
+        REL606 "$INPUT" | bgzip -c > "$OUTPUT"
+
+    tabix -p vcf "$OUTPUT"
+done
+```
+
+# Downstream Analysis (R)
+
+## Parsing VCFs directly
+
+```{r vcf-parsing, eval=FALSE}
+# Requires results/vcf/<run>.PASS.norm.vcf.gz to exist on disk
+runs <- samples$run
+
+vcf_list <- map(runs, function(run) {
+  vcf_path <- file.path(vcf_dir, paste0(run, ".PASS.norm.vcf.gz"))
+  read.vcfR(vcf_path, verbose = FALSE)
+})
+names(vcf_list) <- runs
+
+# Example: extract fixed fields (CHROM, POS, REF, ALT, QUAL) for one sample
+vcf_fix <- as_tibble(getFIX(vcf_list[["SRR2584866"]]))
+kable(head(vcf_fix, 10), caption = "First 10 variant records — SRR2584866 (generation 50,000)")
+```
+
+## Variant count summary (from `variant_counts.tsv` / `pass_variant_summary.tsv`)
+
+```{r variant-counts}
+# variant_counts.tsv: sample, generation, run, raw_variants, filtered_variants
+variant_counts <- tribble(
+  ~sample,      ~generation, ~run,         ~raw_variants, ~filtered_variants,
+  "Ara3_5000",  5000,        "SRR2589044", 13,            9,
+  "Ara3_15000", 15000,       "SRR2584863", 30,            26,
+  "Ara3_50000", 50000,       "SRR2584866", 817,           794
+)
+
+# pass_variant_summary.tsv: sample, generation, run, pass_variants, snps, indels, ts_tv
+pass_summary <- tribble(
+  ~sample,      ~generation, ~run,         ~pass_variants, ~snps, ~indels, ~ts_tv,
+  "Ara3_5000",  5000,        "SRR2589044", 9,              6,     3,       2.00,
+  "Ara3_15000", 15000,       "SRR2584863", 26,             20,    6,       0.33,
+  "Ara3_50000", 50000,       "SRR2584866", 794,            688,   106,     10.86
+)
+
+kable(variant_counts, caption = "Raw vs. quality-filtered (PASS) variant counts per sample")
+kable(pass_summary, caption = "PASS variant composition and Ts/Tv ratio per sample")
+```
+
+```{r variant-counts-plot}
+pass_summary %>%
+  select(sample, generation, snps, indels) %>%
+  pivot_longer(c(snps, indels), names_to = "type", values_to = "count") %>%
+  mutate(sample = fct_reorder(sample, generation)) %>%
+  ggplot(aes(x = sample, y = count, fill = type)) +
+  geom_col(position = "stack") +
+  labs(title = "PASS SNPs vs. indels by generation",
+       x = "Sample (ordered by generation)", y = "Variant count", fill = "Type") +
+  theme_minimal()
+```
+
+```{r tstv-plot}
+ggplot(pass_summary, aes(x = generation, y = ts_tv)) +
+  geom_line(color = "steelblue") +
+  geom_point(size = 3, color = "steelblue") +
+  scale_x_continuous(breaks = pass_summary$generation) +
+  labs(title = "Transition/Transversion (Ts/Tv) ratio across generations",
+       x = "Generation", y = "Ts/Tv ratio") +
+  theme_minimal()
+```
+
+## Mutation spectrum (from `substitution_spectrum.tsv`)
+
+```{r mutation-spectrum}
+substitution_spectrum <- tribble(
+  ~sample, ~generation, ~run, ~substitution, ~count,
+  "Ara3_5000", 5000, "SRR2589044", "A>G", 2,
+  "Ara3_5000", 5000, "SRR2589044", "A>C", 0,
+  "Ara3_5000", 5000, "SRR2589044", "A>T", 0,
+  "Ara3_5000", 5000, "SRR2589044", "C>T", 2,
+  "Ara3_5000", 5000, "SRR2589044", "C>G", 0,
+  "Ara3_5000", 5000, "SRR2589044", "C>A", 2,
+  "Ara3_15000", 15000, "SRR2584863", "A>G", 2,
+  "Ara3_15000", 15000, "SRR2584863", "A>C", 8,
+  "Ara3_15000", 15000, "SRR2584863", "A>T", 1,
+  "Ara3_15000", 15000, "SRR2584863", "C>T", 3,
+  "Ara3_15000", 15000, "SRR2584863", "C>G", 0,
+  "Ara3_15000", 15000, "SRR2584863", "C>A", 6,
+  "Ara3_50000", 50000, "SRR2584866", "A>G", 260,
+  "Ara3_50000", 50000, "SRR2584866", "A>C", 13,
+  "Ara3_50000", 50000, "SRR2584866", "A>T", 9,
+  "Ara3_50000", 50000, "SRR2584866", "C>T", 370,
+  "Ara3_50000", 50000, "SRR2584866", "C>G", 12,
+  "Ara3_50000", 50000, "SRR2584866", "C>A", 24
+)
+
+datatable(substitution_spectrum, caption = "Collapsed substitution spectrum by sample")
+```
+
+```{r spectrum-plot, fig.width=9}
+substitution_spectrum %>%
+  mutate(sample = fct_reorder(sample, generation)) %>%
+  ggplot(aes(x = substitution, y = count, fill = substitution)) +
+  geom_col() +
+  facet_wrap(~ sample, scales = "free_y") +
+  labs(title = "Collapsed single-nucleotide substitution spectrum",
+       x = "Substitution class", y = "Count") +
+  theme_minimal() +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## Functional annotation summary (from `impact_summary.tsv` / `consequence_summary.tsv`)
+
+```{r impact-summary}
+impact_summary <- tribble(
+  ~generation, ~impact,     ~count,
+  5000,        "HIGH",      2,
+  5000,        "MODERATE",  6,
+  5000,        "MODIFIER",  75,
+  15000,       "HIGH",      3,
+  15000,       "MODERATE",  17,
+  15000,       "MODIFIER",  232,
+  50000,       "HIGH",      72,
+  50000,       "LOW",       213,
+  50000,       "MODERATE",  374,
+  50000,       "MODIFIER",  7367
+)
+
+datatable(impact_summary, caption = "SnpEff impact-category counts by generation")
+```
+
+```{r impact-plot}
+impact_summary %>%
+  mutate(impact = factor(impact, levels = c("HIGH", "MODERATE", "LOW", "MODIFIER"))) %>%
+  ggplot(aes(x = factor(generation), y = count, fill = impact)) +
+  geom_col(position = "fill") +
+  labs(title = "Relative proportion of SnpEff impact categories by generation",
+       x = "Generation", y = "Proportion", fill = "Impact") +
+  theme_minimal()
+```
+
+```{r consequence-summary}
+consequence_summary <- tribble(
+  ~generation, ~consequence,          ~count,
+  5000,  "missense_variant",   6,
+  5000,  "frameshift_variant", 2,
+  5000,  "intergenic_region",  1,
+  15000, "missense_variant",   16,
+  15000, "frameshift_variant", 3,
+  15000, "intergenic_region",  6,
+  50000, "missense_variant",     369,
+  50000, "synonymous_variant",   212,
+  50000, "frameshift_variant",   62,
+  50000, "stop_gained",          9,
+  50000, "intergenic_region",    122
+)
+
+datatable(consequence_summary, caption = "Selected SnpEff consequence-type counts by generation (coding + intergenic classes)")
+```
+
+## Annotated gene table — high-impact and biologically flagged variants
+
+```{r gene-table}
+# Subset drawn from results/statistics/annotation/high_impact_variants.tsv,
+# citrate_gene_variants.tsv, and dna_repair_variants.tsv
+flagged_variants <- tribble(
+  ~sample,       ~generation, ~gene,  ~consequence,        ~impact,    ~hgvs_p,
+  "Ara3_50000",  50000,       "mutS", "stop_gained",        "HIGH",     "p.Gln606*",
+  "Ara3_50000",  50000,       "mutS", "missense_variant",   "MODERATE", "p.Arg500His",
+  "Ara3_50000",  50000,       "mutL", "missense_variant",   "MODERATE", "p.Ser567Gly",
+  "Ara3_5000",   5000,        "dam",  "missense_variant",   "MODERATE", "p.Pro141Thr",
+  "Ara3_50000",  50000,       "citT", "missense_variant",   "MODERATE", "p.Thr341Ile",
+  "Ara3_50000",  50000,       "citF", "missense_variant",   "MODERATE", "p.Glu51Lys",
+  "Ara3_50000",  50000,       "citA", "frameshift_variant", "HIGH",     "p.Val493fs",
+  "Ara3_50000",  50000,       "lacZ", "stop_gained",        "HIGH",     "p.Trp433*",
+  "Ara3_50000",  50000,       "ddlB", "stop_gained",        "HIGH",     "p.Trp182*",
+  "Ara3_50000",  50000,       "mutY", "frameshift_variant", "HIGH",     "p.Gly318fs"
+)
+
+datatable(flagged_variants,
+          caption = "Selected high-impact and biologically flagged variants (mismatch-repair and citrate-operon genes)",
+          options = list(pageLength = 10))
+```
+
+# Session Info
+
+```{r session-info}
+sessionInfo()
+```
