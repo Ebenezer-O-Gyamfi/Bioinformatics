@@ -1,0 +1,89 @@
+---
+title: "16S Pipeline — Phyloseq Object, Alpha Diversity, Ordination, Abundance"
+subtitle: "16S rRNA Microbiome Pipeline (DADA2) — group project"
+output: html_document
+---
+
+## Step 10: Build the Phyloseq object
+
+```{r load-phyloseq}
+library(phyloseq)
+library(Biostrings)
+library(ggplot2)
+theme_set(theme_bw())
+
+seqtab.nochim <- readRDS(file.path(rds_dir, "seqtab_nochim.rds"))
+taxa <- readRDS(file.path(rds_dir, "taxa.rds"))
+```
+
+```{r build-metadata}
+samples.out <- rownames(seqtab.nochim)
+
+# group/gender = leading letters; subjects = digits before "D"
+gender_code <- sub("^(A-Za-z]+).*$", "\\1", samples.out)
+subject <- sub("^[A-Za-z]+([0-9]+)D.*$", "\\1", samples.out)
+day <- suppressWarnings(as.integer(sub("^.*D([0-9]+)$", "\\1", samples.out)))
+
+samdf <- data.frame(
+  Sample = samples.out,
+  Gender = ifelse(gender_code == "F", "Female",
+                  ifelse(gender_code == "M", "Male", gender_code)),
+  Subject = subject,
+  Day = day,
+  row.names = samples.out,
+  stringsAsFactors = FALSE
+)
+
+# Early vs Late
+samdf$When <- ifelse(samdf$Day < 100, "Early", "Late")
+
+# Mock/Control samples will not fit longitudinal design
+is_ctrl <- grepl("mock|control|blank|ntc", samples.out, ignore.case = TRUE) | is.na(samdf$Day)
+samdf$When[is_ctrl] <- NA
+samdf$Subject[is_ctrl] <- NA
+
+head(samdf)
+table(samdf$When, useNA = "ifany")
+```
+
+## Construct the object
+
+```{r build-phyloseq}
+ps <- phyloseq(
+  otu_table(seqtab.nochim, taxa_are_rows = FALSE),
+  sample_data(samdf),
+  tax_table(taxa)
+)
+
+# replace long ASV sequences with short labels; keep sequences in refseq()
+dna <- Biostrings::DNAStringSet(taxa_names(ps))
+names(dna) <- taxa_names(ps)
+ps <- merge_phyloseq(ps, dna)
+taxa_names(ps) <- paste0("ASV", seq(ntaxa(ps)))
+
+ps
+saveRDS(ps, file.path(rds_dir, "phyloseq.rds"))
+```
+
+## Alpha Diversity
+
+```{r alpha-diversity, fig.wdth=9}
+# plot_richness expects raw counts (do not rarefy/transform first)
+plot_richness(ps, x = "Day", measures = c("Shannon", "Simpson"), color = "When")
+```
+
+## Ordination (NMDS, Bray-Curtis)
+
+```{r ordination}
+ps.prop <- transform_sample_counts(ps, function(x) x / sum(x))
+ord.nmds.bray <- ordinate(ps.prop, method = "NMDS", distance = "bray")
+plot_ordination(ps.prop, ord.nmds.bray, color = "When", title = "NMDS (Bray-Curtis)")
+```
+
+## Abundance barplot (abundant families only)
+
+```{r abundance-barplot, fig.width=11}
+abundant <- taxa_names(ps)[taxa_sums(ps) > 500]
+ps.ab <- transform_sample_counts(prune_taxa(abundant, ps), function(x) x / sum(x))
+plot_bar(ps.ab, x = "Sample", fill = "Family") + facet_wrap(~When, scales = "free_x")
+```

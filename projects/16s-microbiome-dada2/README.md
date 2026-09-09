@@ -4,14 +4,20 @@
 
 Memory-efficient 16S rRNA amplicon pipeline on a mouse gut microbiome dataset, covering ASV inference through differential abundance testing.
 
-## Workflow
-1. Read quality inspection, filtering, and trimming
-2. Error-rate learning, denoising, and merging (DADA2)
-3. Sequence table construction and chimera removal
-4. Taxonomy assignment (SILVA v138.1 reference database)
-5. `phyloseq` object construction and exploration
-6. Alpha diversity, NMDS/Bray-Curtis ordination, and abundance barplots
-7. Differential abundance analysis (DESeq2 and ANCOM-BC2), with cross-checking between the two methods
+## Structure
+```
+scripts/
+  01_qc_filter_trim.Rmd        Package setup, read QC, filtering & trimming
+  02_denoise_taxonomy.Rmd      Error learning, denoise/merge, chimera
+                                removal, read tracking, taxonomy assignment
+                                (SILVA v138.1)
+  03_phyloseq_diversity.Rmd    Phyloseq object, alpha diversity, NMDS/
+                                Bray-Curtis ordination, abundance barplots
+  04_differential_abundance.Rmd  Differential abundance via DESeq2 and
+                                  ANCOM-BC2, with cross-checking between
+                                  the two methods
+```
+Run in numeric order — later stages depend on R objects created earlier in the pipeline.
 
 ## My contribution
 _Add a line here describing specifically what you contributed to this group project — e.g. which sections you wrote, ran, or interpreted._

@@ -23,3 +23,7 @@ I hold a First Class Honours BSc in Biology from KNUST and previously worked as 
 ## Note on group projects
 
 Two projects in this repository (differential expression analysis and the 16S microbiome pipeline) were completed as part of a class group project. Each of those project READMEs credits the teammates whose code the analysis builds on.
+
+## Note on pipeline provenance
+
+The variant-analysis and RNA-seq projects follow a shell-pipeline structure provided as a course assignment template, run independently by each student on the assigned dataset. Each project README states this explicitly.

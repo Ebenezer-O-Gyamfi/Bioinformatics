@@ -1,0 +1,174 @@
+---
+title: "16S Pipeline — Error Learning, Denoise/Merge, Chimera Removal, Taxonomy"
+subtitle: "16S rRNA Microbiome Pipeline (DADA2) — group project"
+output: html_document
+---
+
+## Step 3: Learn the Error Rates
+
+```{r learn-errors}
+errF <- learnErrors(filt.dataF, multithread = N_THREADS)
+errR <- learnErrors(filt.dataR, multithread = N_THREADS)
+
+saveRDS(errF, file.path(rds_dir, "errF.rds"))
+saveRDS(errR, file.path(rds_dir, "errR.rds"))
+mem_report("after learnErrors")
+```
+
+```{r plot-errors}
+plotErrors(errF, nominalQ = TRUE)
+plotErrors(errR, nominalQ = TRUE)
+```
+
+## Steps 4 - 5: Denoise + Merge
+
+This is a memory-critical step and requires optimization. Instead of calling `dada2()` on **all** samples at once, loop **one sample at a time**: `dereplicate -> denoise F -> denoise R -> merge -> store only merged result -> free everything else -> gc()`
+
+```{r denoise-merge-loop}
+# (Re)load inputs - this block can be rerun in case session ends due to memory depletion 
+sample.names <- readRDS(file.path(rds_dir, "sample_names.rds")) 
+errF <- readRDS(file.path(rds_dir, "errF.rds")) 
+errR <- readRDS(file.path(rds_dir, "errR.rds"))
+filt.dataF <- file.path(filt_dir, paste0(sample.names, "_F_filt.fastq.gz")); names(filt.dataF) <- sample.names
+filt.dataR <- file.path(filt_dir, paste0(sample.names, "_R_filt.fastq.gz")); names(filt.dataR) <- sample.names
+
+mergers <- vector("list", length(sample.names)); names(mergers) <- sample.names
+
+denoisedF <- integer(length(sample.names)); names(denoisedF) <- sample.names
+denoisedR <- integer(length(sample.names)); names(denoisedR) <- sample.names
+
+getN <- function(x) sum(getUniques(x))
+
+for (sam in sample.names) {
+  cat("Denoising:", sam, "\n")
+  
+  derepF <- derepFastq(filt.dataF[[sam]])
+  ddF <- dada(derepF, err = errF, multithread = N_THREADS)
+  
+  derepR <- derepFastq(filt.dataR[[sam]])
+  ddR <- dada(derepR, err = errR, multithread = N_THREADS)
+  
+  merger <- mergePairs(ddF, derepF, ddR, derepR, verbose = FALSE)
+  
+  mergers[[sam]] <- merger
+  denoisedF[[sam]] <- getN(ddF)
+  denoisedR[[sam]] <- getN(ddR)
+  
+  # free per-sample objects before the next iteration
+  rm(derepF, derepR, ddF, ddR, merger)
+  gc(full = TRUE)
+}
+
+saveRDS(mergers, file.path(rds_dir, "mergers.rds"))
+saveRDS(denoisedF, file.path(rds_dir, "denoisedF.rds"))
+saveRDS(denoisedR, file.path(rds_dir, "denoisedR.rds"))
+
+mem_report("after denoise+merge loop")
+```
+
+## Step 6: Make the Sequence Table
+
+```{r make-seqtab}
+mergers <- readRDS(file.path(rds_dir, "mergers.rds"))
+
+seqtab <- makeSequenceTable(mergers)
+cat("Samples x ASVs:", paste(dim(seqtab), collapse = " x "), "\n")
+print(table(nchar(getSequences(seqtab))))
+
+saveRDS(seqtab, file.path(rds_dir, "seqtab.rds"))
+```
+
+## Step 7: Remove Chimeras
+
+```{r remove-chimeras}
+seqtab <- readRDS(file.path(rds_dir, "seqtab.rds"))
+
+seqtab.nochim <- removeBimeraDenovo(
+  seqtab, method = "consensus", multithread = N_THREADS, verbose = TRUE
+)
+
+cat("Non-chimeric ASVs:", ncol(seqtab.nochim), "\n")
+cat("Fraction of reads kept:", round(sum(seqtab.nochim) / sum(seqtab), 4), "\n")
+
+saveRDS(seqtab.nochim, file.path(rds_dir, "seqtab_nochim.rds"))
+```
+
+## Step 8: Track Reads the Pipeline
+
+```{r track-reads}
+out <- readRDS(file.path(rds_dir, "filter_out.rds"))
+sample.names <- readRDS(file.path(rds_dir, "sample_names.rds"))
+denoisedF <- readRDS(file.path(rds_dir, "denoisedF.rds"))
+denoisedR <- readRDS(file.path(rds_dir, "denoisedR.rds"))
+mergers <- readRDS(file.path(rds_dir, "mergers.rds"))
+seqtab.nochim <- readRDS(file.path(rds_dir, "seqtab_nochim.rds"))
+
+getM <- function(x) sum(getUniques(x))
+
+# Align the filter matrix to surviving samples
+out2 <- out[paste0(sample.names, "_F_filt.fastq.gz") %in% basename(names(denoisedF)) | TRUE, , drop = FALSE]
+
+# rebuild from saved pieces matched by sample_id
+track <- cbind(
+  input = out[, "reads.in"][seq_along(sample.names)],
+  filtered = out[, "reads.out"][seq_along(sample.names)],
+  denoisedF = denoisedF,
+  denoisedR = denoisedR,
+  merged = sapply(mergers, getN),
+  nonchim = rowSums(seqtab.nochim)[sample.names]
+)
+rownames(track) <- sample.names
+head(track, 10)
+
+saveRDS(track, file.path(rds_dir, "track_reads.rds"))
+```
+
+## Step 9: Assign Taxonomy - **chunked + low-thread**
+
+```{r assign-taxonomy-chunked}
+seqtab.nochim <- readRDS(file.path(rds_dir, "seqtab_nochim.rds"))
+stopifnot(file.exists(silva_train)) # check that 16S ref is present
+
+seqs <- getSequences(seqtab.nochim)
+chunks <- split(seqs, ceiling(seq_along(seqs) / TAX_CHUNK))
+cat("Assigning taxonomy for", length(seqs), "ASVs in", length(chunks), "chunk(s)\n")
+
+taxa_chunks <- vector("list", length(chunks))
+for (i in seq_along(chunks)) {
+  cat(sprintf(" chunk %d / %d (%d ASVs)\n", i, length(chunks), length(chunks[[i]])))
+  taxa_chunks[[i]] <- assignTaxonomy(
+    chunks[[i]], silva_train,
+    multithread = TAX_THREADS,
+    tryRC = TRUE # guards against reverse-complement orientation issues
+  )
+  gc(full = TRUE) # release the reference + chunk before the next batch
+}
+
+taxa <- do.call(rbind, taxa_chunks)
+rm(taxa_chunks); gc(full = TRUE)
+
+# Species assignment - only run this if you have the species files
+if (file.exists(silva_species)) {
+  sp_chunks <- split(rownames(taxa), ceiling(seq_len(nrow(taxa)) / TAX_CHUNK))
+  taxa_sp <- vector("list", length(sp_chunks))
+  for (i in seq_along(sp_chunks)) {
+    sub <- taxa[sp_chunks[[i]], , drop = FALSE]
+    taxa_sp[[i]] <- addSpecies(sub, silva_species)
+    gc(full = TRUE)
+  }
+  taxa <- do.call(rbind, taxa_sp)
+  rm(taxa_sp); gc(full = TRUE)
+}
+
+saveRDS(taxa, file.path(rds_dir, "taxa.rds"))
+mem_report("after taxonomy")
+```
+
+```{r taxa-inspect}
+taxa.print <- taxa
+rownames(taxa.print) <- NULL
+head(taxa.print)
+
+table(taxa[, "Phylum"], useNA = "ifany")
+cat("ASVs with a species-level call:", sum(!is.na(taxa[, "Species"])), "of", nrow(taxa), "\n")
+```

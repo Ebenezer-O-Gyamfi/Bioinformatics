@@ -1,0 +1,133 @@
+---
+title: "16S Pipeline — Differential Abundance (DESeq2 & ANCOM-BC2)"
+subtitle: "16S rRNA Microbiome Pipeline (DADA2) — group project"
+output: html_document
+---
+
+## Step 11: Differential Abundance Analysis
+
+**Goal:** find ASVs/taxa whose abundance differs between *Early* and *Late* samples. Two complementary methods will be used: - **DESeq2**: Fast, familiar, integrates directly with the `ps` object
+
+- **ANCOM-BC2**: compositionally-aware method with bias correction. Generally more appropriate default for microbiome relative-abundance data *NB: agreement between methods is reassuring*
+
+```{r da-subset}
+# build a clean data subset - drop controls and any empty ASVs
+ps <- readRDS(file.path(rds_dir, "phyloseq.rds"))
+
+ps_da <- subset_samples(ps, !is.na(When))
+ps_da <- prune_taxa(taxa_sums(ps_da) > 0, ps_da)
+
+# prevalence filter: keep ASVs seen in >= 10% of samples - remove ultra-rare taxa that are just noise
+prev <- apply(otu_table(ps_da), 2, function(x) sum(x > 0))
+keep <- prev >= max(2, ceiling(0.10 * nsamples(ps_da)))
+ps_da <- prune_taxa(taxa_names(ps_da)[keep], ps_da)
+
+# fix reference level so positive results = enriched in "Late"
+sample_data(ps_da)$When <- factor(sample_data(ps_da)$When, levels = c("Early", "Late"))
+
+ps_da
+```
+
+## 11a. DESeq2
+
+```{r da-deseq2}
+library(DESeq2)
+
+# Gaurd against empty samples / taxa left behind by the prevalence filter
+ps_da <- prune_samples(sample_sums(ps_da) > 0, ps_da)
+ps_da <- prune_taxa(taxa_sums(ps_da) > 0, ps_da)
+
+dds <- phyloseq_to_deseq2(ps_da, ~ When)
+
+dds <- estimateSizeFactors(dds, type = "poscounts")
+
+# sanity check - no NA size factors now
+stopifnot(all(!is.na(sizeFactors(dds))))
+
+dds <- DESeq(dds, test = "Wald", fitType = "local")
+res <- results(dds, cooksCutoff = FALSE)
+
+alpha <- 0.05
+sigtab <- as.data.frame(res)
+sigtab <- cbind(sigtab, as(tax_table(ps_da)[rownames(sigtab), ], "matrix"))
+sigtab <- sigtab[!is.na(sigtab$padj) & sigtab$padj < alpha, ]
+sigtab <- sigtab[order(sigtab$log2FoldChange), ]
+
+cat("DESeq2: significant ASVs at padj <", alpha, ":", nrow(sigtab), "\n")
+head(sigtab[, c("baseMean", "log2FoldChange", "padj", "Phylum", "Family", "Genus")], 20)
+
+saveRDS(res, file.path(rds_dir, "deseq2_results.rds"))
+saveRDS(sigtab, file.path(rds_dir, "deseq2_sigtab.rds"))
+```
+
+```{r da-deseq2-plot, fig.width=9, fig.height=6}
+if (nrow(sigtab) > 0) {
+  sigtab$Genus <- factor(sigtab$Genus, levels = unique(sigtab$Genus[order(sigtab$log2FoldChange)]))
+  ggplot(sigtab, aes(x = log2FoldChange, y = Genus, color = Phylum)) + geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") + geom_point(size = 3, alpha = 0.8) + labs(title = "DESeq2: Early vs Late (positive = enriched in Late)", x = "log2 fold change", y = "Genus") + theme(axis.text.y = element_text(size = 8))
+}
+```
+
+## 11b. ANCOM-BC2
+
+ANCOM-BC2 models the sampling fraction bias inherent to compositional data, which DESeq2 does not. Run at the **Genus** level here (aggregating ASVs to genus is common for DA and reduces multiple-testing burden); To test ASVs directly, set "tax_level = NULL"
+
+```{r da-ancombc2}
+library(ANCOMBC)
+library(microbiome)
+
+set.seed(123)
+anc <- ancombc2(
+  data = ps_da,
+  tax_level = "Genus",
+  fix_formula = "When",
+  group = "When",
+  p_adj_method = "BH",
+  prv_cut = 0.10, # prevalence filter inside ANCOM-BC
+  struc_zero = TRUE,
+  n_cl = TAX_THREADS,
+  verbose = TRUE
+)
+
+anc_res <- anc$res
+# effect/q-value cols are named after the contrast, e.g. "WhenLate"
+lfc_col <- grep("^lfc_When", names(anc_res), value = TRUE)
+q_col <- grep("^q_When", names(anc_res), value = TRUE)
+diff_col <- grep("^diff_When", names(anc_res), value = TRUE)
+anc_sig <- anc_res[anc_res[[diff_col]] == TRUE, c("taxon", lfc_col, q_col)]
+anc_sig <- anc_sig[order(anc_sig[[lfc_col]]), ]
+
+cat("ANCOM-BC2: differentially abundant genera:", nrow(anc_sig), "\n")
+head(anc_sig, 20)
+
+saveRDS(anc, file.path(rds_dir, "ancombc2_full.rds"))
+saveRDS(anc_sig, file.path(rds_dir, "ancombc2_sig.rds"))
+```
+
+```{r da-ancombc2-lot, fig.width=9, fig.height=6}
+if (nrow(anc_sig) > 0) {
+  anc_sig$taxon <- factor(anc_sig$taxon, levels = anc_sig$taxon[order(anc_sig[[lfc_col]])])
+  ggplot(anc_sig, aes(x = .data[[lfc_col]], y = taxon)) + geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") + geom_col(fill = "steelblue", alpha = 0.85) +
+    labs(title = "ANCOM-BC2: Early vs Late (positive = enriched in Late)", x = "Bias-corrected log gold change", y = "Genus")
+}
+```
+
+## 11c. Cross-check the two methods
+
+> **Interpretation.** Taxa flagged by **both** methods are your most robust hits — report those with the most confidence. Method-specific hits are worth mentioning but should be flagged as less certain. ANCOM-BC2 is generally the more defensible primary result for compositional data; DESeq2 serves as a familiar sanity check.
+
+```{r da-compare}
+# genera flagged by DESeq2 (mapped from ASV-level results)
+deseq_genera <- unique(na.omit(sigtab$Genus))
+ancom_genera <- if (nrow(anc_sig))
+  as.character(anc_sig$taxon) else character(0)
+
+cat("DESEq2 genera:", length(deseq_genera), 
+    "| ANCOM-BC2 genera:", length(ancom_genera),
+    "| overlap:", length(intersect(deseq_genera, ancom_genera)), "\n")
+intersect(deseq_genera, ancom_genera)
+```
+
+# Session Info
+```{r session-info}
+sessionInfo()
+```

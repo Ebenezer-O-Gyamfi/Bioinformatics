@@ -4,10 +4,12 @@
 
 Differential gene expression analysis on an RNA-seq count dataset (plant infection time-course: mock vs. *Pseudomonas syringae* DC3000 infection, sampled at multiple days post-inoculation), using DESeq2.
 
-## Contents
-- `06_differential_analysis.Rmd` — analysis notebook
-- `raw_counts.csv` — gene-level raw count matrix
-- `samples_to_conditions.csv` — sample metadata (growth condition, infection status, days post-inoculation)
+## Structure
+```
+notebooks/06_differential_analysis.Rmd   Analysis notebook
+data/raw_counts.csv                      Gene-level raw count matrix
+data/samples_to_conditions.csv           Sample metadata (growth, infection, dpi)
+```
 
 ## Workflow
 1. Build `DESeqDataSet` and apply pre-filtering (≥10 reads in ≥3 samples)

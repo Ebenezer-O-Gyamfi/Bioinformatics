@@ -1,0 +1,181 @@
+---
+title: "16S Pipeline — Package Setup, QC, Filter & Trim"
+subtitle: "16S rRNA Microbiome Pipeline (DADA2) — group project"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  eval = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center",
+  fig.width = 7,
+  fig.height = 5
+)
+```
+
+Download the 16S reference genome (to be used for taxonomy here: [**https://zenodo.org/records/4587955**](https://zenodo.org/records/4587955){.uri} (SILVA v138.1)) *silva_nr99_v138.1_train_set.fa.gz* - train data *silva_species_assignment_v138.1.fa.gz* - species data
+
+## Package Installation
+
+```{r install-packages}
+# CRAN packages
+install.packages(c(
+  "ggplot2", "devtools", "vegan", "dplyr",
+  "tidyverse", "remotes", "ggpubr", "rstatix",
+  "stringr", "data.table", "lubridate"
+))
+
+if (!requireNamespace("BiocManager", quietly = TRUE))
+{
+  install.packages("BiocManager")
+}
+BiocManager::install(c("dada2", "phyloseq", "DESeq2",
+                       "ANCOMBC", "Biostrings", "microbiome"))
+
+# nicer plots
+devtools::install_github("thomasp85/patchwork")
+remotes::install_github("gavinsimpson/ggvegan")
+```
+
+## Config paths
+
+```{r config}
+library(dada2)
+library(data.table)
+packageVersion("dada2")
+
+# Paths
+# Raw, gzipped FASTQs
+data <- "~/Desktop/mini_desktop/KNUST/second_sem/high_throughput_seq/mouse_full_data/"
+
+# project folder for all derived outputs
+proj_dir <- "~//Desktop/mini_desktop/KNUST/second_sem/high_throughput_seq/mouse_full_data/"
+
+# r object file dir
+rds_dir <- file.path(proj_dir, "rds")
+
+# filtered fastqs written by DADA2
+filt_dir <- file.path(data, "filtered")
+
+# SILVA training data files(for taxonomy)
+ref_dir <- file.path(proj_dir, "reference")
+
+for (d in c(proj_dir, rds_dir, ref_dir)) dir.create(d, recursive = TRUE, showWarnings = FALSE)
+
+# SILVA Reference DB
+silva_train <- file.path(ref_dir, "silva_nr99_v138.1_train_set.fa.gz")
+silva_species <- file.path(ref_dir, "silva_species_assignment_v138.1.fa.gz")
+
+# Threading (for memory and faster processing)
+N_THREADS <- max(1, parallel::detectCores() - 1) # for filtering/denoising
+TAX_THREADS <- 2 # keep low for taxonomy genx
+TAX_CHUNK <- 2000 # ASVs per taxonomy batch
+
+# Helper: report current R memory use
+mem_report <- function(tag = "") {
+  gc(full = TRUE)
+  used_mb <- sum(gc()[, "used"] * c(8,8)) / 1e6
+  cat(sprintf("[MEM %s] R heap ~%.0f MB\n", tag, used_mb))
+  invisible(NULL)
+}
+```
+
+## The Dataset
+
+This is the full **Schloss lab** mouse-gut dataset with the following convention
+
+```         
+M1D13_S12_L001_R1_001.fastq.gz
+└───┘ └─┘ └──┘ └┘ └─┘
+  │    │    │   │   └ read chunk index
+  │    │    │   └──── read direction (R1 = forward, R2 = reverse)
+  │    │    └──────── lane
+  │    └───────────── Illumina sample number (S12)
+  └────────────────── sample id (M1D13)
+```
+
+## Read in and sort the fastq file names
+
+```{r list-fastqs}
+# forward (R1) and reverse (R2) reads
+dataF <- sort(list.files(data, pattern = "_R1_001\\.fastq\\.gz$", full.names = TRUE))
+dataR <- sort(list.files(data, pattern = "_R2_001\\.fastq\\.gz$", full.names = TRUE))
+
+# sample ID
+sample.names <- sapply(strsplit(basename(dataF), "_"), `[`, 1)
+cat("Forward files:", length(dataF)," Reverse files:", length(dataR), "\n")
+cat("First few samples:", paste(head(sample.names), collapse = ", "), "\n")
+
+# sanity checks
+stopifnot(length(dataF) == length(dataR))
+# confirm R1/R2 line up sample-for-sample
+ok <- identical(
+  sub("_R1_001\\.fastq\\.gz$", "", basename(dataF)),
+  sub("_R2_001\\.fastq\\.gz$", "", basename(dataR))
+)
+stopifnot(ok)
+```
+
+## Step 1: Inspect Read Quality Profiles
+
+```{r qc-forward}
+# aggregate profile across a random subset of samples
+set.seed(100)
+idx <- sort(sample(seq_along(dataF), min(20, length(dataF))))
+
+plotQualityProfile(dataF[idx], aggregate = TRUE) + ggplot2::ggtitle("Forward (R1) - aggregate")
+```
+
+```{r qc-reverse}
+plotQualityProfile(dataR[idx], aggregate = TRUE) + ggplot2::ggtitle("Reverse (R2) - aggregate")
+```
+
+## Step 2: Filter and Trim
+
+```{r filter-paths}
+filt.dataF <- file.path(filt_dir, paste0(sample.names, "_F_filt.fastq.gz"))
+filt.dataR <- file.path(filt_dir, paste0(sample.names, "_R_filt.fastq.gz"))
+
+names(filt.dataF) <- sample.names
+names(filt.dataR) <- sample.names
+```
+
+| Parameter | Forward | Reverse | Meaning |
+|-------------------|------------------|------------------|------------------|
+| `truncLen` | 240 | 160 | Truncate reads at this length (guided by quality plots) |
+| `maxEE` | 2 | 2 | Max expected errors per read |
+| `maxN` | 0 | 0 | No ambiguous bases allowed |
+| `truncQ` | 2 | 2 | Truncate at first base with quality ≤ 2 |
+| `rm.phix` | TRUE | TRUE | Remove PhiX control reads |
+
+```{r filter-and-trim}
+out <- filterAndTrim(
+  dataF, filt.dataF, dataR, filt.dataR,
+  truncLen = c(240, 160),
+  maxN = 0, maxEE = c(2, 2), truncQ = 2, rm.phix = TRUE,
+  compress = TRUE, multithread = N_THREADS
+)
+head(out)
+
+# some samples can lose ALL reads after filtering which can break downstream steps - drop them
+kept <- file.exists(filt.dataF) &
+  file.exists(filt.dataR)
+if (any(!kept)) {
+  message("Dropping ", sum(!kept), " sample(s) with no reads after filtering: ",
+          paste(sample.names[!kept], collapse = ", "))
+}
+filt.dataF <- filt.dataF[kept]
+filt.dataR <- filt.dataR[kept]
+sample.names <- sample.names[kept]
+
+saveRDS(out, file.path(rds_dir, "filter_out.rds"))
+saveRDS(sample.names, file.path(rds_dir, "sample_names.rds"))
+```
+
+```{r qc-after-filter}
+plotQualityProfile(filt.dataR[idx], aggregate = TRUE)
+plotQualityProfile(filt.dataF[idx], aggregate = TRUE)
+```
