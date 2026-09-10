@@ -3,6 +3,7 @@ set -euo pipefail
 RAW_DIR="data/raw"
 mkdir -p "$RAW_DIR"
 
+
 download_file () {
     URL="$1"; OUTPUT="$2"
     if [[ -s "$OUTPUT" ]]; then
