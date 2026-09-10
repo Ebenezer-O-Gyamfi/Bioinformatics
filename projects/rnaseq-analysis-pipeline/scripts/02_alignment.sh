@@ -18,6 +18,7 @@ GTF_URL="https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_${GEN
 
 mkdir -p "$REF_DIR" "$(dirname "$INDEX_PREFIX")" "$ALIGN_DIR" "$MULTIQC_DIR" logs
 
+
 # --- dependency check ------------------------------------------------------
 for PROGRAM in hisat2 hisat2-build hisat2_extract_splice_sites.py samtools wget gzip awk multiqc; do
   command -v "$PROGRAM" >/dev/null 2>&1 || { echo "Missing: $PROGRAM"; exit 1; }
