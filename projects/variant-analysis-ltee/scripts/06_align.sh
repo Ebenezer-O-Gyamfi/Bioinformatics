@@ -6,6 +6,7 @@ BAM_DIR="results/bam"
 QC_DIR="results/statistics/alignment"
 mkdir -p "$BAM_DIR" "$QC_DIR"
 
+
 SUMMARY="${QC_DIR}/alignment_summary.tsv"
 printf "sample\tgeneration\trun\ttotal_reads\tmapped_reads\tmapping_percent\tproperly_paired\tproperly_paired_percent\tmean_depth\tbreadth_1x_percent\tbreadth_10x_percent\n" > "$SUMMARY"
 
