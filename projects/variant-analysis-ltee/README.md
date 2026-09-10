@@ -8,9 +8,6 @@ Whole-genome resequencing variant-calling and annotation pipeline applied to thr
 | Ara3_15000 | 15,000 | SRR2584863 |
 | Ara3_50000 | 50,000 | SRR2584866 |
 
-## Pipeline provenance
-
-The pipeline structure (script stages, tools, and dataset) was provided as a course assignment template; each student ran it independently on the same assigned samples. The commands, execution, result interpretation, and downstream analysis in this repository are my own.
 
 ## Structure
 ```
