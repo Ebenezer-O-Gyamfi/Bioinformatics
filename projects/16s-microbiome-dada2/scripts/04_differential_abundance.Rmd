@@ -1,6 +1,6 @@
 ---
 title: "16S Pipeline — Differential Abundance (DESeq2 & ANCOM-BC2)"
-subtitle: "16S rRNA Microbiome Pipeline (DADA2) — group project"
+subtitle: "16S rRNA Microbiome Pipeline (DADA2)"
 output: html_document
 ---
 
