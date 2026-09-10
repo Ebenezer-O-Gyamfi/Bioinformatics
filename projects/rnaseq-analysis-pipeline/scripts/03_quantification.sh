@@ -18,6 +18,7 @@ BAMS=( "$ALIGN_DIR"/*/*.sorted.bam )
 featureCounts -T "$THREADS" -s "$STRAND_MODE" -t exon -g gene_id \
   -a "$GTF" -o "$COUNTS" "${BAMS[@]}"
 
+
 # --- clean, DESeq2-ready count matrix (drop featureCounts metadata cols) --
 awk '
   BEGIN { FS=OFS="\t" }
