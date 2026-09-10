@@ -4,6 +4,7 @@ REF="data/reference/ecoli_rel606.fasta"
 BAM_DIR="results/bam"; BCF_DIR="results/bcf"; VCF_DIR="results/vcf"
 mkdir -p "$BCF_DIR" "$VCF_DIR"
 
+
 tail -n +2 metadata/samples.tsv |
 while IFS=$'\t' read -r SAMPLE GENERATION RUN R1 R2; do
     BAM="${BAM_DIR}/${RUN}.aligned.sorted.bam"
