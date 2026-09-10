@@ -2,9 +2,6 @@
 
 An end-to-end RNA-seq workflow: QC, splice-aware alignment, gene-level quantification, and differential expression, applied to the SRP144496 dataset (HT55 and SW948 cell lines, itraconazole vs. control).
 
-## Pipeline provenance
-
-The pipeline structure (script stages, tools, and dataset) was provided as a course assignment template; each student ran it independently. The commands, execution, result interpretation, and differential expression analysis in this repository are my own.
 
 ## Structure
 ```
