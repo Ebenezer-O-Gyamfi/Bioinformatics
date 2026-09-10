@@ -4,7 +4,7 @@
 MSc Biodata Analytics & Computational Genomics, Kwame Nkrumah University of Science and Technology (KNUST)
 [LinkedIn](https://linkedin.com/in/ebenopponggyamfi) · ebenopponggyamfi@gmail.com
 
-This repository collects analysis pipelines and reports from my MSc coursework and independent practice in bioinformatics and computational genomics. Each project folder contains the analysis code (R Markdown) and a project-specific README describing the objective, data, methods, and tools used. Rendered PDF reports are in [`/reports`](./reports).
+This repository collects analysis pipelines and reports from my practice projects in bioinformatics and computational genomics. Each project folder contains the analysis code (R Markdown) and a project-specific README describing the objective, data, methods, and tools used. Rendered PDF reports are in [`/reports`](./reports).
 
 ## Projects
 
