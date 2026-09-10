@@ -18,4 +18,4 @@ This repository collects analysis pipelines and reports from my MSc coursework a
 
 ## Background
 
-I hold a First Class Honours BSc in Biology from KNUST and previously worked as a University Research Assistant at the Kumasi Centre for Collaborative Research in Tropical Medicine (KCCR), where I gained hands-on experience in laboratory and field research methods. I am currently pursuing computational and statistical methods in genomics through my MSc and independent project work.
+I hold a First Class Honours BSc in Biology from KNUST and previously worked as a University Research Assistant at the Kumasi Centre for Collaborative Research in Tropical Medicine (KCCR), where I gained hands-on experience in laboratory and field research methods. I am currently pursuing computational and statistical methods in genomics through my MSc and independent project work. 
