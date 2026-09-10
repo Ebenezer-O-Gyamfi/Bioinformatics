@@ -19,11 +19,3 @@ This repository collects analysis pipelines and reports from my MSc coursework a
 ## Background
 
 I hold a First Class Honours BSc in Biology from KNUST and previously worked as a University Research Assistant at the Kumasi Centre for Collaborative Research in Tropical Medicine (KCCR), where I gained hands-on experience in laboratory and field research methods. I am currently pursuing computational and statistical methods in genomics through my MSc and independent project work.
-
-## Note on group projects
-
-Two projects in this repository (differential expression analysis and the 16S microbiome pipeline) were completed as part of a class group project. Each of those project READMEs credits the teammates whose code the analysis builds on.
-
-## Note on pipeline provenance
-
-The variant-analysis and RNA-seq projects follow a shell-pipeline structure provided as a course assignment template, run independently by each student on the assigned dataset. Each project README states this explicitly.
