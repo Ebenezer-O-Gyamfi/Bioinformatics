@@ -1,6 +1,6 @@
 ---
 title: "16S Pipeline — Phyloseq Object, Alpha Diversity, Ordination, Abundance"
-subtitle: "16S rRNA Microbiome Pipeline (DADA2) — group project"
+subtitle: "16S rRNA Microbiome Pipeline (DADA2)"
 output: html_document
 ---
 
