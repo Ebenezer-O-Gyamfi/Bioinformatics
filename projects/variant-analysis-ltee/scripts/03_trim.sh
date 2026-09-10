@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+
 set -euo pipefail
 TRIM_DIR="data/trimmed"
 UNPAIRED_DIR="${TRIM_DIR}/unpaired"
