@@ -1,5 +1,5 @@
 ---
-title: "LTEE Ara-3 Variant Analysis — Downstream Analysis (R)"
+title: "LTEE Ara-3 Variant Analysis — Downstream Analysis"
 subtitle: "Continues from scripts/01_download.sh through scripts/10_annotate_variants.sh"
 author: "Ebenezer Oppong Gyamfi"
 output: html_document
