@@ -1,7 +1,5 @@
 # 16S rRNA Microbiome Pipeline (DADA2)
 
-**Group project** — completed as part of a class group assignment. Team members: Ebenezer Oppong Gyamfi, Joshua Ampofo Yentumi (add other teammates here if applicable).
-
 Memory-efficient 16S rRNA amplicon pipeline on a mouse gut microbiome dataset, covering ASV inference through differential abundance testing.
 
 ## Structure
@@ -19,8 +17,6 @@ scripts/
 ```
 Run in numeric order — later stages depend on R objects created earlier in the pipeline.
 
-## My contribution
-_Add a line here describing specifically what you contributed to this group project — e.g. which sections you wrote, ran, or interpreted._
 
 ## Report
 Full rendered report: [`/reports/16s-microbiome-dada2_report.pdf`](../../reports/16s-microbiome-dada2_report.pdf)
