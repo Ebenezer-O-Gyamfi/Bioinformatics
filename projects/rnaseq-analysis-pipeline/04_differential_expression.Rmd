@@ -5,7 +5,7 @@ author: "Ebenezer Oppong Gyamfi"
 output: html_document
 ---
 
-# Stage 4 — Differential Expression Analysis (executed in this document)
+# Stage 4 — Differential Expression Analysis
 
 The remaining chunks are **live R code**. When the count matrix and sample
 sheet produced by Stages 1–3 are present under `PROJECT_ROOT`, running
