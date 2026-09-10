@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-
 set -euo pipefail
 VCF_DIR="results/vcf"; OUT_DIR="results/annotation"; STATS_DIR="results/statistics/annotation"
 mkdir -p "$OUT_DIR" "$STATS_DIR"
