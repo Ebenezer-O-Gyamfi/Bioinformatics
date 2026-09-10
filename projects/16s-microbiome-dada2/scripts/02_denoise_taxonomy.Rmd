@@ -1,6 +1,6 @@
 ---
 title: "16S Pipeline — Error Learning, Denoise/Merge, Chimera Removal, Taxonomy"
-subtitle: "16S rRNA Microbiome Pipeline (DADA2) — group project"
+subtitle: "16S rRNA Microbiome Pipeline (DADA2)"
 output: html_document
 ---
 
