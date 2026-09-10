@@ -42,6 +42,7 @@ while IFS=$'\t' read -r RUN URL EXPECTED_SIZE; do
 done < <(awk -F'\t' -v r="$RUN_COL" -v f="$FTP_COL" -v b="$BYTE_COL" \
             'NR>1 {print $r"\t"$f"\t"$b}' "$METADATA")
 
+
 # --- QC ----------------------------------------------------------------
 fastqc --threads "$THREADS" --outdir "$FASTQC_DIR" "$RAW_DIR"/*.fastq.gz
 
