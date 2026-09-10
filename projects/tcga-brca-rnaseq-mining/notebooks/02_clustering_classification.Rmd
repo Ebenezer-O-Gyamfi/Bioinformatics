@@ -1,5 +1,5 @@
 ---
-title: "TCGA-BRCA RNA-Seq Data Mining:Preprocessing and Machine learning"
+title: "TCGA-BRCA RNA-Seq Data Mining: Preprocessing and Machine Learning"
 author: "Ebenezer Oppong Gyamfi"
 date: "`r format(Sys.Date(), '%d %B %Y')`"
 output:
