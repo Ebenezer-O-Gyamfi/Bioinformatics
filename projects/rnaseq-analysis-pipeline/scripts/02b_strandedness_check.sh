@@ -12,6 +12,7 @@ assignment_pct() {
   ' "$1"
 }
 
+
 paste <(assignment_pct "$DIR/counts_s0.txt.summary") \
       <(assignment_pct "$DIR/counts_s1.txt.summary") \
       <(assignment_pct "$DIR/counts_s2.txt.summary") |
