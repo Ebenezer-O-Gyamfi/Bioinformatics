@@ -31,7 +31,7 @@ head(tcga_data)
 # 1. Introduction
 
 This report documents the complete data-mining workflow applied to the
-TCGA Breast Invasive Carcinoma (BRCA) RNA-Seq Level 3 mRNAseq dataset
+TCGA Breast Invasive Carcinoma (BRCA) RNA-Seq Level 3 mRNA-seq dataset
 (RSEM output, Broad GDAC Firehose pipeline). The dataset encompasses
 **878 samples** and an initial **20,503 gene identifiers**. The pipeline
 covers: data structuring, noise removal, missing-value handling,
