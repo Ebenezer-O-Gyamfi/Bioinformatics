@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+
 set -euo pipefail
 REF_DIR="data/reference"
 REF="${REF_DIR}/ecoli_rel606.fasta"
