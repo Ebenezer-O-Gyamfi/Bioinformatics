@@ -15,7 +15,4 @@ This repository collects analysis pipelines and reports from my practice project
 | [Variant Analysis (LTEE Ara-3)](./projects/variant-analysis-ltee) | Whole-genome variant calling and annotation pipeline on *E. coli* long-term evolution experiment data | Shell pipeline, variant callers, R for downstream analysis |
 | [Differential Expression Analysis](./projects/differential-expression-deseq2) | Calling differentially expressed genes with DESeq2, volcano plots, and heatmaps | R, DESeq2, EnhancedVolcano, pheatmap |
 | [16S rRNA Microbiome Pipeline](./projects/16s-microbiome-dada2) | ASV inference, taxonomy assignment, and differential abundance analysis on 16S microbiome data | R, DADA2, phyloseq, DESeq2, ANCOM-BC2 |
-
-## Background
-
-I hold a First Class Honours BSc in Biology from KNUST and previously worked as a University Research Assistant at the Kumasi Centre for Collaborative Research in Tropical Medicine (KCCR), where I gained hands-on experience in laboratory and field research methods. I am currently pursuing computational and statistical methods in genomics through my MSc and independent project work. 
+ 
